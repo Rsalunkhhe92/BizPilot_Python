@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin Panel</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Arial, sans-serif;
+      background: #f5f7fb;
+      color: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: linear-gradient(135deg, #eef4ff, #f8fafc);
+    }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 20px 60px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+    }
+    #login {
+      max-width: 420px;
+      margin: 80px auto 0;
+      padding: 30px;
+    }
+    h1 { margin: 0 0 8px; font-size: 34px; }
+    p { color: #64748b; margin: 0 0 24px; }
+    label { display: block; margin: 16px 0 6px; font-size: 13px; font-weight: 700; }
+    input, select, button {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid #dbe2ea;
+      font-size: 15px;
+    }
+    button {
+      background: #0f766e;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      font-weight: 700;
+      margin-top: 20px;
+    }
+    button.secondary {
+      background: #475569;
+    }
+    #message { min-height: 20px; margin-top: 16px; color: #b91c1c; }
+    #dashboard { display: none; }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 22px;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat {
+      padding: 24px;
+    }
+    .stat h3 {
+      margin: 0 0 14px;
+      font-size: 14px;
+      text-transform: uppercase;
+      color: #64748b;
+      letter-spacing: 0.05em;
+    }
+    .stat strong {
+      font-size: 34px;
+      display: block;
+    }
+    .panel {
+      padding: 22px;
+      margin-top: 18px;
+    }
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid #e5e7eb;
+      padding: 14px 10px;
+      vertical-align: top;
+    }
+    th {
+      color: #475569;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .pill {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #dcfce7;
+      color: #166534;
+    }
+    .pill.inactive {
+      background: #fef3c7;
+      color: #92400e;
+    }
+    .pill.cancelled {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+    .table-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .table-actions button {
+      width: auto;
+      min-width: 88px;
+      margin-top: 0;
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+    .action-delete { background: #b91c1c; }
+    .grid-form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px 16px;
+    }
+    .full-width { grid-column: 1 / -1; }
+    @media (max-width: 760px) {
+      .stats, .grid-form { grid-template-columns: 1fr; }
+      .panel-header, .topbar { display: block; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section id="login" class="card">
+      <h1>AutoLedger</h1>
+      <p>Administrator sign in</p>
+      <form id="login-form">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="email" required>
+        <label for="dob">Date of birth</label>
+        <input id="dob" name="dob" type="date" required>
+        <button type="submit">Log in as administrator</button>
+      </form>
+      <div id="message" role="status"></div>
+    </section>
+
+    <section id="dashboard">
+      <div class="topbar">
+        <div>
+          <h1>Welcome, <span id="name"></span></h1>
+          <p>Admin access confirmed.</p>
+        </div>
+        <button class="secondary" id="logout-button" type="button">Log out</button>
+      </div>
+
+      <div class="stats">
+        <div class="card stat">
+          <h3>Total users</h3>
+          <strong id="total-users">0</strong>
+        </div>
+        <div class="card stat">
+          <h3>Active users</h3>
+          <strong id="active-users">0</strong>
+        </div>
+        <div class="card stat">
+          <h3>Inactive users</h3>
+          <strong id="inactive-users">0</strong>
+        </div>
+      </div>
+
+      <div class="card panel">
+        <div class="panel-header">
+          <h2>Create / update customer</h2>
+        </div>
+        <form id="customer-form">
+          <div class="grid-form">
+            <div class="full-width">
+              <label for="fullName">Full name</label>
+              <input id="fullName" name="fullName" type="text" required>
+            </div>
+            <div>
+              <label for="customer-email">Email</label>
+              <input id="customer-email" name="email" type="email" required>
+            </div>
+            <div>
+              <label for="customer-dob">Date of birth</label>
+              <input id="customer-dob" name="dob" type="date" required>
+            </div>
+            <div>
+              <label for="customer-status">Status</label>
+              <select id="customer-status" name="status">
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+                <option value="suspended">Suspended</option>
+              </select>
+            </div>
+            <div>
+              <label for="subscription-plan">Subscription plan</label>
+              <select id="subscription-plan" name="subscriptionPlan">
+                <option value="">No plan</option>
+                <option value="monthly">Monthly</option>
+                <option value="quarterly">Quarterly</option>
+                <option value="yearly">Yearly</option>
+              </select>
+            </div>
+            <div class="full-width">
+              <button type="submit" id="customer-submit">Add customer</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <div class="card panel">
+        <div class="panel-header">
+          <h2>Customer list</h2>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>DOB</th>
+              <th>Status</th>
+              <th>Plan</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="customer-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const loginSection = document.querySelector('#login');
+    const dashboardSection = document.querySelector('#dashboard');
+    const loginForm = document.querySelector('#login-form');
+    const customerForm = document.querySelector('#customer-form');
+    const message = document.querySelector('#message');
+    const tableBody = document.querySelector('#customer-table-body');
+    const nameEl = document.querySelector('#name');
+    const totalUsersEl = document.querySelector('#total-users');
+    const activeUsersEl = document.querySelector('#active-users');
+    const inactiveUsersEl = document.querySelector('#inactive-users');
+
+    const state = {
+      currentUser: null,
+      editingCustomerId: null,
+    };
+
+    function getAdminHeaders() {
+      return {
+        'Content-Type': 'application/json',
+        'X-User-Type': 'admin',
+        'X-User-Email': state.currentUser ? state.currentUser.email : ''
+      };
+    }
+
+    function setMessage(text, isError = true) {
+      message.textContent = text;
+      message.style.color = isError ? '#b91c1c' : '#166534';
+    }
+
+    function showDashboard(user) {
+      state.currentUser = user;
+      loginSection.style.display = 'none';
+      dashboardSection.style.display = 'block';
+      nameEl.textContent = user.fullName;
+      loadDashboard();
+    }
+
+    function showLogin() {
+      state.currentUser = null;
+      state.editingCustomerId = null;
+      dashboardSection.style.display = 'none';
+      loginSection.style.display = 'block';
+      customerForm.reset();
+      document.querySelector('#customer-submit').textContent = 'Add customer';
+    }
+
+    async function loadDashboard() {
+      const dashboardResponse = await fetch('/api/admin/dashboard', {
+        headers: getAdminHeaders(),
+      });
+      const dashboardResult = await dashboardResponse.json();
+      if (!dashboardResponse.ok) {
+        setMessage(dashboardResult.message || 'Admin dashboard unavailable');
+        showLogin();
+        return;
+      }
+
+      totalUsersEl.textContent = dashboardResult.totalUsers;
+      activeUsersEl.textContent = dashboardResult.activeUsers;
+      inactiveUsersEl.textContent = dashboardResult.inactiveUsers;
+
+      const customersResponse = await fetch('/api/admin/drivers', {
+        headers: getAdminHeaders(),
+      });
+      const customersResult = await customersResponse.json();
+      if (!customersResponse.ok) {
+        setMessage(customersResult.message || 'Customer list unavailable');
+        return;
+      }
+
+      renderCustomers(customersResult.drivers || []);
+    }
+
+    function renderCustomers(customers) {
+      if (!customers.length) {
+        tableBody.innerHTML = '<tr><td colspan="6">No customers found.</td></tr>';
+        return;
+      }
+
+      tableBody.innerHTML = customers.map((customer) => `
+        <tr>
+          <td>${customer.fullName}</td>
+          <td>${customer.email}</td>
+          <td>${customer.dob}</td>
+          <td><span class="pill ${customer.status === 'active' ? '' : customer.status === 'cancelled' ? 'cancelled' : 'inactive'}">${customer.status}</span></td>
+          <td><span class="pill ${customer.subscriptionStatus === 'active' ? '' : 'inactive'}">${customer.subscriptionPlan || 'none'}</span></td>
+          <td>
+            <div class="table-actions">
+              <button type="button" data-edit-id="${customer.id}">Edit</button>
+              <button type="button" class="action-delete" data-delete-id="${customer.id}">Delete</button>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+
+      tableBody.querySelectorAll('[data-edit-id]').forEach((button) => {
+        button.addEventListener('click', () => editCustomer(Number(button.dataset.editId), customers));
+      });
+
+      tableBody.querySelectorAll('[data-delete-id]').forEach((button) => {
+        button.addEventListener('click', () => deleteCustomer(Number(button.dataset.deleteId)));
+      });
+    }
+
+    async function deleteCustomer(customerId) {
+      const response = await fetch(`/api/admin/drivers/${customerId}`, {
+        method: 'DELETE',
+        headers: getAdminHeaders(),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setMessage(result.message || 'Delete failed');
+        return;
+      }
+      setMessage('Customer deleted successfully', false);
+      loadDashboard();
+    }
+
+    function editCustomer(customerId, customers) {
+      const customer = customers.find((item) => item.id === customerId);
+      if (!customer) return;
+
+      state.editingCustomerId = customerId;
+      document.querySelector('#fullName').value = customer.fullName;
+      document.querySelector('#customer-email').value = customer.email;
+      document.querySelector('#customer-dob').value = customer.dob;
+      document.querySelector('#customer-status').value = customer.status;
+      document.querySelector('#subscription-plan').value = customer.subscriptionPlan === 'none' ? '' : customer.subscriptionPlan;
+      document.querySelector('#customer-submit').textContent = 'Update customer';
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    loginForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      setMessage('');
+      
+      // Format date from input (YYYY-MM-DD) to backend format
+      const dobValue = loginForm.dob.value; // This comes as YYYY-MM-DD from date input
+      
+      const response = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: loginForm.email.value.trim().toLowerCase(),
+          dob: dobValue,
+        })
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        setMessage(result.message || 'Login failed');
+        return;
+      }
+      
+      // Only admins can access web interface
+      if (result.user.userType !== 'admin') {
+        setMessage('Access denied. Admin users only. Please use the mobile app if you are a customer.');
+        return;
+      }
+      
+      showDashboard(result.user);
+    });
+
+    customerForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const payload = {
+        fullName: customerForm.fullName.value,
+        email: customerForm.email.value,
+        dob: customerForm.dob.value,
+        status: customerForm.status.value,
+        subscriptionPlan: customerForm.subscriptionPlan.value,
+      };
+
+      const method = state.editingCustomerId ? 'PUT' : 'POST';
+      const url = state.editingCustomerId ? `/api/admin/drivers/${state.editingCustomerId}` : '/api/admin/drivers';
+
+      const response = await fetch(url, {
+        method,
+        headers: getAdminHeaders(),
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        setMessage(result.message || 'Customer operation failed');
+        return;
+      }
+
+      setMessage('Customer saved successfully', false);
+      state.editingCustomerId = null;
+      customerForm.reset();
+      document.querySelector('#customer-submit').textContent = 'Add customer';
+      loadDashboard();
+    });
+
+    document.querySelector('#logout-button').addEventListener('click', showLogin);
+  </script>
+</body>
+</html>

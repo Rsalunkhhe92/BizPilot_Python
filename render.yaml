@@ -1,0 +1,22 @@
+databases:
+  - name: autoledger-db
+    plan: free
+    databaseName: autoledger
+    user: autoledger
+
+services:
+  - type: web
+    name: autoledger-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: autoledger-db
+          property: connectionString
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FLASK_DEBUG
+        value: "0"
