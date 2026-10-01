@@ -53,6 +53,7 @@ def _estimate_driver_distance_km(rows):
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+MAX_VOICE_AUDIO_CHARS = 8_000_000  # ~6 MB of base64, plenty for a short voice question
 
 
 def ensure_assistant_schema(cursor):
@@ -80,6 +81,31 @@ def _call_gemini(system_prompt, message, api_key):
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    candidates = result.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("No response candidates from Gemini")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+def _call_gemini_audio(system_prompt, audio_base64, mime_type, api_key):
+    """Sends a short voice question to Gemini (multimodal) and returns its text reply."""
+    url = GEMINI_API_URL.format(model=GEMINI_MODEL) + f"?key={api_key}"
+    body = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": audio_base64}},
+                {"text": "Listen to this audio and reply with the JSON described in your instructions."},
+            ],
+        }],
+        "generationConfig": {"maxOutputTokens": 400, "temperature": 0.2, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     candidates = result.get("candidates", [])
     if not candidates:
@@ -293,6 +319,35 @@ def _build_driver_context(cur, owner_id):
         (owner_id, week_start, today),
     )
     last_7_days_daily_earnings = [{"date": r[0].isoformat(), "amount": float(r[1] or 0)} for r in cur.fetchall()]
+    last_7_days_total_earnings = sum(d["amount"] for d in last_7_days_daily_earnings)
+
+    def _sum_fuel(start_date, end_date):
+        cur.execute(
+            "SELECT COALESCE(SUM(total_cost), 0) FROM driver_fuel_logs "
+            "WHERE owner_id = %s AND NOT deleted AND fuel_time::date BETWEEN %s AND %s",
+            (owner_id, start_date, end_date),
+        )
+        return float(cur.fetchone()[0] or 0)
+
+    def _sum_earnings(start_date, end_date):
+        cur.execute(
+            "SELECT COALESCE(SUM(fare), 0) FROM driver_trips "
+            "WHERE owner_id = %s AND NOT deleted AND trip_time::date BETWEEN %s AND %s",
+            (owner_id, start_date, end_date),
+        )
+        return float(cur.fetchone()[0] or 0)
+
+    today_fuel_cost = _sum_fuel(today, today)
+    last_7_days_fuel_cost = _sum_fuel(week_start, today)
+
+    prev_week_start = week_start - timedelta(days=7)
+    prev_week_end = week_start - timedelta(days=1)
+    previous_7_days_total_earnings = _sum_earnings(prev_week_start, prev_week_end)
+    previous_7_days_fuel_cost = _sum_fuel(prev_week_start, prev_week_end)
+
+    month_start = today.replace(day=1)
+    month_to_date_earnings = _sum_earnings(month_start, today)
+    month_to_date_fuel_cost = _sum_fuel(month_start, today)
 
     return {
         "businessType": "auto-rickshaw driver",
@@ -301,12 +356,44 @@ def _build_driver_context(cur, owner_id):
         "todayTripCount": today_count,
         "todayDistanceKm": today_distance_km,
         "todayEarningsByPaymentMode": {k: v["amount"] for k, v in today_by_mode.items()},
+        "todayFuelCost": today_fuel_cost,
+        "todayNetProfit": today_total - today_fuel_cost,
         "last7DaysDailyEarnings": last_7_days_daily_earnings,
+        "last7DaysTotalEarnings": last_7_days_total_earnings,
+        "last7DaysFuelCost": last_7_days_fuel_cost,
+        "previous7DaysTotalEarnings": previous_7_days_total_earnings,
+        "previous7DaysFuelCost": previous_7_days_fuel_cost,
+        "monthToDateEarnings": month_to_date_earnings,
+        "monthToDateFuelCost": month_to_date_fuel_cost,
     }
 
 
 def _is_driver_business(bt_lower):
     return any(k in bt_lower for k in ("auto", "driver", "rickshaw"))
+
+
+def _resolve_business_context(cur, owner_id):
+    """Looks up the owner's business type and builds their grounding data context.
+    Returns (full_name, business_type, context), or None if the account doesn't exist."""
+    cur.execute("SELECT full_name, business_type FROM userdetails WHERE id = %s", (owner_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    full_name, business_type = row
+    bt_lower = (business_type or "").lower()
+
+    if any(k in bt_lower for k in ("fruit", "vegetable", "retail")):
+        context = _build_inventory_context(cur, owner_id)
+    elif "collection" in bt_lower:
+        context = _build_collection_context(cur, owner_id)
+    elif _is_driver_business(bt_lower):
+        context = _build_driver_context(cur, owner_id)
+    else:
+        context = {
+            "businessType": business_type or "unknown",
+            "note": "Detailed data tracking isn't available for this business type yet.",
+        }
+    return full_name, business_type, context
 
 
 @assistant_bp.post("/chat")
@@ -329,24 +416,10 @@ def chat():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT full_name, business_type FROM userdetails WHERE id = %s", (owner_id,))
-                row = cur.fetchone()
-                if not row:
+                resolved = _resolve_business_context(cur, owner_id)
+                if not resolved:
                     return jsonify({"error": "Account not found"}), 404
-                full_name, business_type = row
-                bt_lower = (business_type or "").lower()
-
-                if any(k in bt_lower for k in ("fruit", "vegetable", "retail")):
-                    context = _build_inventory_context(cur, owner_id)
-                elif "collection" in bt_lower:
-                    context = _build_collection_context(cur, owner_id)
-                elif _is_driver_business(bt_lower):
-                    context = _build_driver_context(cur, owner_id)
-                else:
-                    context = {
-                        "businessType": business_type or "unknown",
-                        "note": "Detailed data tracking isn't available for this business type yet.",
-                    }
+                full_name, business_type, context = resolved
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -384,6 +457,93 @@ def chat():
         return jsonify({"reply": "AI assistant is unavailable right now. Please try again in a moment."})
 
     return jsonify({"reply": reply_text})
+
+
+@assistant_bp.post("/voice-chat")
+def voice_chat():
+    """Lets the owner ask a short spoken question about their own business data
+    instead of typing it - e.g. 'how much fuel did I spend this month'. One
+    multimodal Gemini call both transcribes the question and answers it, grounded
+    in the same data context as the text /chat endpoint. Never saves anything."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = payload.get("ownerId") or payload.get("owner_id")
+    audio_base64 = str(payload.get("audioBase64", ""))
+    mime_type = str(payload.get("mimeType", "audio/m4a")).strip() or "audio/m4a"
+
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if not audio_base64:
+        return jsonify({"error": "audioBase64 is required"}), 400
+    if len(audio_base64) > MAX_VOICE_AUDIO_CHARS:
+        return jsonify({"error": "Recording is too long. Please keep it under a few seconds."}), 200
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({
+            "reply": "The AI assistant isn't set up yet. Ask the app owner to add a free GEMINI_API_KEY "
+                     "(from aistudio.google.com/apikey) to the backend configuration to enable me."
+        })
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                resolved = _resolve_business_context(cur, owner_id)
+                if not resolved:
+                    return jsonify({"error": "Account not found"}), 404
+                full_name, business_type, context = resolved
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    system_prompt = (
+        f"You are the AI Assistant inside the AutoLedger app, answering a SPOKEN question from "
+        f"{full_name or 'the business owner'} about their own business, using ONLY the JSON data below. "
+        f"The question may be in English, Hindi, or Marathi. Today's date is {date.today().isoformat()}.\n"
+        "Rules:\n"
+        "- First, transcribe what was said as accurately as possible, in the original language.\n"
+        "- If the audio is silent, unintelligible, or just background noise, set transcript to an empty "
+        "string and reply to \"Sorry, I couldn't hear a question. Please try again.\" Do NOT guess a question "
+        "that wasn't actually asked.\n"
+        "- Never invent or guess any number, fact, or detail that isn't explicitly present in the data. No hallucination.\n"
+        "- Answer only what was asked. Do not add extra facts, suggestions, tips, or unrelated details.\n"
+        "- Simple social pleasantries (hi, hello, thank you, how are you, etc.) are NOT information requests — "
+        "reply to these naturally and warmly in a short, friendly line, without mentioning data.\n"
+        "- For anything else the data doesn't cover, reply with EXACTLY: \"I don't have information about that.\"\n"
+        "- Format money with the ₹ symbol and comma-separated numbers (e.g. ₹5,250).\n"
+        "- Keep the reply short: 1-2 sentences, plain text, no markdown.\n"
+        "- Reply with STRICT JSON only, no markdown fences, in exactly this shape: "
+        '{"transcript": "<what you heard>", "reply": "<your answer>"}\n\n'
+        f"DATA:\n{json.dumps(context)}"
+    )
+
+    try:
+        raw_reply = _call_gemini_audio(system_prompt, audio_base64, mime_type, api_key)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        print(f"AI voice assistant HTTP error {e.code}: {err_body}")
+        return jsonify({"reply": "AI assistant is unavailable right now. Please try again in a moment."})
+    except Exception as e:
+        print(f"AI voice assistant error: {e}")
+        return jsonify({"reply": "AI assistant is unavailable right now. Please try again in a moment."})
+
+    cleaned = raw_reply.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        return jsonify({
+            "transcript": "",
+            "reply": "Sorry, I couldn't process that. Please try again or type your question instead.",
+        })
+
+    return jsonify({
+        "transcript": parsed.get("transcript", ""),
+        "reply": parsed.get("reply") or "Sorry, I couldn't generate a response. Please try again.",
+    })
 
 
 def _build_yesterday_summary_context(cur, owner_id):

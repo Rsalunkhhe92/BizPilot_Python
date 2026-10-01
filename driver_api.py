@@ -229,20 +229,49 @@ def serialize_trip(row):
 TRIP_COLUMNS = "id, route, fare, payment_mode, start_km, end_km, source, trip_time, location_name, latitude, longitude"
 
 
+def _parse_date_range_args():
+    """Shared by /trips and /fuel-logs: an explicit start_date/end_date (YYYY-MM-DD)
+    range takes priority over the relative `days` param, which in turn falls back to
+    today-only. Invalid or partial dates are ignored rather than erroring out."""
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    try:
+        if start_date:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        if end_date:
+            datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        start_date = None
+        end_date = None
+    if not (start_date and end_date):
+        start_date = None
+        end_date = None
+
+    days = request.args.get("days")
+    try:
+        days = max(1, min(90, int(days))) if days else None
+    except (TypeError, ValueError):
+        days = None
+
+    return start_date, end_date, days
+
+
 @driver_bp.get("/trips")
 def list_trips():
     owner_id = get_owner_id()
     if not owner_id:
         return jsonify({"error": "owner_id is required"}), 400
     try:
-        days = request.args.get("days")
-        try:
-            days = max(1, min(90, int(days))) if days else None
-        except (TypeError, ValueError):
-            days = None
+        start_date, end_date, days = _parse_date_range_args()
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                if days:
+                if start_date and end_date:
+                    cur.execute(
+                        f"SELECT {TRIP_COLUMNS} FROM driver_trips WHERE owner_id = %s "
+                        "AND NOT deleted AND trip_time::date BETWEEN %s AND %s ORDER BY trip_time DESC",
+                        (owner_id, start_date, end_date),
+                    )
+                elif days:
                     # days=7 means "today plus the 6 days before it"
                     cur.execute(
                         f"SELECT {TRIP_COLUMNS} FROM driver_trips WHERE owner_id = %s "
@@ -284,14 +313,16 @@ def list_fuel_logs():
     if not owner_id:
         return jsonify({"error": "owner_id is required"}), 400
     try:
-        days = request.args.get("days")
-        try:
-            days = max(1, min(90, int(days))) if days else None
-        except (TypeError, ValueError):
-            days = None
+        start_date, end_date, days = _parse_date_range_args()
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                if days:
+                if start_date and end_date:
+                    cur.execute(
+                        f"SELECT {FUEL_LOG_COLUMNS} FROM driver_fuel_logs WHERE owner_id = %s "
+                        "AND NOT deleted AND fuel_time::date BETWEEN %s AND %s ORDER BY fuel_time DESC",
+                        (owner_id, start_date, end_date),
+                    )
+                elif days:
                     cur.execute(
                         f"SELECT {FUEL_LOG_COLUMNS} FROM driver_fuel_logs WHERE owner_id = %s "
                         "AND NOT deleted AND fuel_time::date >= CURRENT_DATE - (%s - 1) ORDER BY fuel_time DESC",
