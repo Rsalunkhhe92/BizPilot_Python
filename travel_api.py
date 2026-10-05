@@ -11,7 +11,10 @@ the caller passes ownerId (or X-User-Id), and every trip/seat endpoint re-verifi
 trip belongs to that owner before reading or writing anything.
 """
 
+import json
 import os
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 
 from flask import Blueprint, jsonify, request
@@ -20,6 +23,27 @@ import psycopg
 travel_bp = Blueprint("travel", __name__, url_prefix="/api/travel")
 
 MAX_SEATS = 80
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def _call_gemini(system_prompt, message, api_key):
+    """Call the free-tier Google Gemini API and return the reply text."""
+    url = GEMINI_API_URL.format(model=GEMINI_MODEL) + f"?key={api_key}"
+    body = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": message}]}],
+        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.4, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    candidates = result.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("No response candidates from Gemini")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 def get_db_connection():
@@ -43,6 +67,33 @@ def get_owner_id(payload=None):
     return None
 
 
+def _parse_date_range_args():
+    """Shared by report-style list endpoints: an explicit start_date/end_date
+    (YYYY-MM-DD) range takes priority over the relative `days` param, which in turn
+    falls back to no date filtering at all (caller decides the default)."""
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    try:
+        if start_date:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        if end_date:
+            datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        start_date = None
+        end_date = None
+    if not (start_date and end_date):
+        start_date = None
+        end_date = None
+
+    days = request.args.get("days")
+    try:
+        days = max(1, min(90, int(days))) if days else None
+    except (TypeError, ValueError):
+        days = None
+
+    return start_date, end_date, days
+
+
 def ensure_travel_schema(cursor):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS travel_trips (
@@ -52,7 +103,7 @@ def ensure_travel_schema(cursor):
             travel_date DATE NOT NULL,
             departure_time VARCHAR(10) NOT NULL DEFAULT '',
             bus_number VARCHAR(30) DEFAULT '',
-            bus_type VARCHAR(10) NOT NULL DEFAULT 'seater' CHECK (bus_type IN ('seater', 'sleeper')),
+            bus_type VARCHAR(10) NOT NULL DEFAULT 'seater' CHECK (bus_type IN ('seater', 'sleeper', 'ertiga')),
             total_seats INT NOT NULL CHECK (total_seats > 0 AND total_seats <= 80),
             sleeper_seats INT NOT NULL DEFAULT 0,
             fare NUMERIC(10, 2) NOT NULL DEFAULT 0,
@@ -62,6 +113,8 @@ def ensure_travel_schema(cursor):
         );
         ALTER TABLE travel_trips ADD COLUMN IF NOT EXISTS bus_type VARCHAR(10) NOT NULL DEFAULT 'seater';
         ALTER TABLE travel_trips ADD COLUMN IF NOT EXISTS sleeper_seats INT NOT NULL DEFAULT 0;
+        ALTER TABLE travel_trips DROP CONSTRAINT IF EXISTS travel_trips_bus_type_check;
+        ALTER TABLE travel_trips ADD CONSTRAINT travel_trips_bus_type_check CHECK (bus_type IN ('seater', 'sleeper', 'ertiga'));
         CREATE INDEX IF NOT EXISTS idx_travel_trips_owner_date ON travel_trips(owner_id, travel_date DESC);
 
         CREATE TABLE IF NOT EXISTS travel_seat_bookings (
@@ -126,7 +179,7 @@ def ensure_travel_schema(cursor):
             owner_id BIGINT NOT NULL REFERENCES userdetails(id) ON DELETE CASCADE,
             reg_number VARCHAR(30) NOT NULL,
             model VARCHAR(150) DEFAULT '',
-            bus_type VARCHAR(10) NOT NULL DEFAULT 'seater' CHECK (bus_type IN ('seater', 'sleeper')),
+            bus_type VARCHAR(10) NOT NULL DEFAULT 'seater' CHECK (bus_type IN ('seater', 'sleeper', 'ertiga')),
             fuel_type VARCHAR(20) NOT NULL DEFAULT 'Diesel' CHECK (fuel_type IN ('Diesel', 'Petrol', 'CNG', 'Electric')),
             reg_date DATE,
             total_km NUMERIC(10, 1) NOT NULL DEFAULT 0,
@@ -138,6 +191,8 @@ def ensure_travel_schema(cursor):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         ALTER TABLE travel_vehicles ADD COLUMN IF NOT EXISTS bus_type VARCHAR(10) NOT NULL DEFAULT 'seater';
+        ALTER TABLE travel_vehicles DROP CONSTRAINT IF EXISTS travel_vehicles_bus_type_check;
+        ALTER TABLE travel_vehicles ADD CONSTRAINT travel_vehicles_bus_type_check CHECK (bus_type IN ('seater', 'sleeper', 'ertiga'));
         CREATE INDEX IF NOT EXISTS idx_travel_vehicles_owner ON travel_vehicles(owner_id);
     """)
 
@@ -265,6 +320,201 @@ def list_trips():
         return jsonify({"error": str(e)}), 500
 
 
+@travel_bp.get("/bookings")
+def list_bookings():
+    """Individual paid seat bookings across all trips, for the Reports tab's
+    earnings/payment-mix/best-day charts - the Travel equivalent of a driver's
+    individual trip-fare records. Defaults to today only, like other report
+    list endpoints; days/start_date/end_date widen the window."""
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    try:
+        start_date, end_date, days = _parse_date_range_args()
+        query = """
+            SELECT b.id, b.fare, b.payment_mode, b.booked_at, t.route
+            FROM travel_seat_bookings b
+            JOIN travel_trips t ON b.trip_id = t.id
+            WHERE t.owner_id = %s AND b.payment_status = 'paid'
+        """
+        params = [owner_id]
+        if start_date and end_date:
+            query += " AND b.booked_at::date BETWEEN %s AND %s"
+            params += [start_date, end_date]
+        elif days:
+            query += " AND b.booked_at::date >= CURRENT_DATE - (%s - 1)"
+            params.append(days)
+        else:
+            query += " AND b.booked_at::date = CURRENT_DATE"
+        query += " ORDER BY b.booked_at DESC"
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
+                bookings = [
+                    {
+                        "id": str(r[0]),
+                        "fare": float(r[1] or 0),
+                        "paymentMode": r[2],
+                        "bookedAt": r[3].isoformat() if r[3] else None,
+                        "route": r[4] or "",
+                    }
+                    for r in cur.fetchall()
+                ]
+        return jsonify({"bookings": bookings})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@travel_bp.get("/fare-suggestions")
+def fare_suggestions():
+    """Flags upcoming trips whose booking pace is notably faster or slower than this
+    operator's own historical average for that route, as a demand signal for fare
+    adjustment. Pure arithmetic, not an AI call - keeps it fast, free, and free of
+    hallucination risk for something touching money."""
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT t.route, AVG(COALESCE(bk.booked_count, 0)::float / NULLIF(t.total_seats, 0))
+                    FROM travel_trips t
+                    LEFT JOIN (
+                        SELECT trip_id, COUNT(*) AS booked_count
+                        FROM travel_seat_bookings GROUP BY trip_id
+                    ) bk ON bk.trip_id = t.id
+                    WHERE t.owner_id = %s AND t.status != 'cancelled' AND t.travel_date < CURRENT_DATE
+                    GROUP BY t.route
+                    HAVING COUNT(*) >= 2
+                    """,
+                    (owner_id,),
+                )
+                historical_fill = {row[0]: float(row[1] or 0) for row in cur.fetchall() if row[1] is not None}
+
+                cur.execute(
+                    """
+                    SELECT t.id, t.route, t.travel_date, t.fare, t.total_seats, COALESCE(bk.booked_count, 0)
+                    FROM travel_trips t
+                    LEFT JOIN (
+                        SELECT trip_id, COUNT(*) AS booked_count
+                        FROM travel_seat_bookings GROUP BY trip_id
+                    ) bk ON bk.trip_id = t.id
+                    WHERE t.owner_id = %s AND t.status != 'cancelled' AND t.travel_date >= CURRENT_DATE
+                    ORDER BY t.travel_date ASC
+                    """,
+                    (owner_id,),
+                )
+
+                today = date.today()
+                suggestions = []
+                for trip_id, route, travel_date, fare, total_seats, booked_count in cur.fetchall():
+                    hist_fill = historical_fill.get(route)
+                    if hist_fill is None or hist_fill <= 0 or not total_seats:
+                        continue
+                    days_left = (travel_date - today).days
+                    current_fill = booked_count / total_seats
+                    ratio = current_fill / hist_fill
+
+                    if days_left >= 2 and ratio >= 1.2 and current_fill >= 0.3:
+                        suggestions.append({
+                            "tripId": str(trip_id),
+                            "route": route,
+                            "travelDate": travel_date.isoformat(),
+                            "daysLeft": days_left,
+                            "currentFillPct": round(current_fill * 100),
+                            "historicalFillPct": round(hist_fill * 100),
+                            "signal": "high_demand",
+                            "currentFare": float(fare or 0),
+                        })
+                    elif days_left <= 2 and ratio <= 0.6:
+                        suggestions.append({
+                            "tripId": str(trip_id),
+                            "route": route,
+                            "travelDate": travel_date.isoformat(),
+                            "daysLeft": days_left,
+                            "currentFillPct": round(current_fill * 100),
+                            "historicalFillPct": round(hist_fill * 100),
+                            "signal": "low_demand",
+                            "currentFare": float(fare or 0),
+                        })
+        return jsonify({"suggestions": suggestions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@travel_bp.post("/draft-reminder")
+def draft_reminder():
+    """Drafts a short, friendly passenger reminder message via Gemini for a specific
+    booking, which the app shows to the operator to review and send themselves
+    (e.g. via a WhatsApp deep link) - never sends anything automatically."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    trip_id = payload.get("tripId")
+    seat_number = payload.get("seatNumber")
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if not trip_id or seat_number is None:
+        return jsonify({"error": "tripId and seatNumber are required"}), 400
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({
+            "error": "AI drafting isn't set up yet. Ask the app owner to add a free GEMINI_API_KEY "
+                     "(from aistudio.google.com/apikey) to the backend configuration to enable it."
+        }), 200
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT b.passenger_name, b.seat_number, b.mobile_number, b.pickup_location,
+                           t.route, t.travel_date, t.departure_time
+                    FROM travel_seat_bookings b
+                    JOIN travel_trips t ON b.trip_id = t.id
+                    WHERE b.trip_id = %s AND b.seat_number = %s AND t.owner_id = %s
+                    """,
+                    (trip_id, seat_number, owner_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Booking not found"}), 404
+                passenger_name, seat_number, mobile_number, pickup_location, route, travel_date, departure_time = row
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    details = (
+        f"Passenger: {passenger_name}\n"
+        f"Route: {route}\n"
+        f"Travel date: {travel_date.isoformat()}\n"
+        f"Departure time: {departure_time}\n"
+        f"Seat number: {seat_number}\n"
+        f"Pickup point: {pickup_location or 'as discussed'}"
+    )
+    system_prompt = (
+        "You are drafting a short WhatsApp reminder message for a bus passenger in India, on behalf of the "
+        "bus operator. Use ONLY the details given below - never invent a detail that isn't present. Keep it "
+        "to 2-3 short sentences, warm and professional, in simple plain English. Mention the passenger's name, "
+        "route, travel date, departure time, seat number, and pickup point, and remind them to arrive 15 "
+        "minutes early. Do not add a signature, placeholder brackets, or markdown. Reply with ONLY the message "
+        "text, nothing else.\n\n" + details
+    )
+
+    try:
+        reply_text = _call_gemini(system_prompt, "Draft the reminder message now.", api_key)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        print(f"Draft reminder HTTP error {e.code}: {err_body}")
+        return jsonify({"error": "AI drafting is unavailable right now. Please try again or write it manually."}), 200
+    except Exception as e:
+        print(f"Draft reminder error: {e}")
+        return jsonify({"error": "AI drafting is unavailable right now. Please try again or write it manually."}), 200
+
+    return jsonify({"message": reply_text.strip(), "mobileNumber": mobile_number or ""})
+
+
 @travel_bp.get("/route-stops")
 def list_route_stops():
     """Owner-managed pickup/drop stop list for a route (case-insensitive match on route name)."""
@@ -367,7 +617,7 @@ def create_trip():
     except (TypeError, ValueError):
         fare = 0
     bus_type = str(payload.get("busType", "seater")).strip().lower()
-    if bus_type not in ("seater", "sleeper"):
+    if bus_type not in ("seater", "sleeper", "ertiga"):
         bus_type = "seater"
     try:
         sleeper_seats = int(payload.get("sleeperSeats") or 0)
@@ -418,8 +668,8 @@ def update_trip(trip_id):
         values.append(str(payload.get("busNumber", "")).strip())
     if "busType" in payload:
         bus_type = str(payload.get("busType", "")).strip().lower()
-        if bus_type not in ("seater", "sleeper"):
-            return jsonify({"error": "busType must be 'seater' or 'sleeper'"}), 400
+        if bus_type not in ("seater", "sleeper", "ertiga"):
+            return jsonify({"error": "busType must be 'seater', 'sleeper', or 'ertiga'"}), 400
         fields.append("bus_type = %s")
         values.append(bus_type)
         if bus_type != "sleeper":
@@ -693,6 +943,7 @@ def list_fuel_logs():
     if not owner_id:
         return jsonify({"error": "owner_id is required"}), 400
     trip_id = request.args.get("trip_id")
+    start_date, end_date, days = _parse_date_range_args()
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -710,6 +961,12 @@ def list_fuel_logs():
                 if trip_id and str(trip_id).strip() and str(trip_id).lower() != "all":
                     query += " AND f.trip_id = %s"
                     params.append(int(trip_id))
+                if start_date and end_date:
+                    query += " AND f.fuel_date BETWEEN %s AND %s"
+                    params += [start_date, end_date]
+                elif days:
+                    query += " AND f.fuel_date >= CURRENT_DATE - (%s - 1)"
+                    params.append(days)
                 query += " ORDER BY f.fuel_date DESC, f.id DESC"
                 cur.execute(query, tuple(params))
                 logs = [serialize_fuel_log(r) for r in cur.fetchall()]
@@ -925,7 +1182,7 @@ def create_vehicle():
     if fuel_type not in ("Diesel", "Petrol", "CNG", "Electric"):
         fuel_type = "Diesel"
     bus_type = str(payload.get("busType", "seater")).strip().lower()
-    if bus_type not in ("seater", "sleeper"):
+    if bus_type not in ("seater", "sleeper", "ertiga"):
         bus_type = "seater"
     try:
         total_km = float(payload.get("totalKm") or 0)
@@ -978,8 +1235,8 @@ def update_vehicle(vehicle_id):
         values.append(str(payload.get("model", "")).strip())
     if "busType" in payload:
         bus_type = str(payload.get("busType", "")).strip().lower()
-        if bus_type not in ("seater", "sleeper"):
-            return jsonify({"error": "busType must be 'seater' or 'sleeper'"}), 400
+        if bus_type not in ("seater", "sleeper", "ertiga"):
+            return jsonify({"error": "busType must be 'seater', 'sleeper', or 'ertiga'"}), 400
         fields.append("bus_type = %s")
         values.append(bus_type)
     if "fuelType" in payload:

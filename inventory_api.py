@@ -7,12 +7,44 @@ plus daily per-product transactions with daily/weekly/monthly filtering.
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+import json
 import os
+import urllib.error
+import urllib.request
 
 from flask import Blueprint, jsonify, request
 import psycopg
 
 inventory_bp = Blueprint("inventory", __name__, url_prefix="/api/inventory")
+
+MAX_VOICE_AUDIO_CHARS = 8_000_000  # ~6 MB of base64, plenty for a short voice note
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def _call_gemini_audio(system_prompt, audio_base64, mime_type, api_key):
+    """Sends a short voice note to Gemini (multimodal) and returns its text reply."""
+    url = GEMINI_API_URL.format(model=GEMINI_MODEL) + f"?key={api_key}"
+    body = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": audio_base64}},
+                {"text": "Listen to this audio and reply with the JSON described in your instructions."},
+            ],
+        }],
+        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.15, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    candidates = result.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("No response candidates from Gemini")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 def get_db_connection():
@@ -76,14 +108,18 @@ def serialize_product(row):
 
 def serialize_transaction(row):
     (tid, product_id, product_name, quantity, unit, amount, transaction_type, payment_method,
-     transaction_date, note, created_at) = row
+     transaction_date, note, created_at, amount_paid) = row
+    amount_f = float(amount or 0)
+    paid_f = float(amount_paid or 0)
     return {
         "id": str(tid),
         "productId": str(product_id) if product_id is not None else None,
         "productName": product_name,
         "quantity": float(quantity or 0),
         "unit": unit,
-        "amount": float(amount or 0),
+        "amount": amount_f,
+        "amountPaid": paid_f,
+        "amountDue": round(amount_f - paid_f, 2) if transaction_type == "PURCHASE" else 0,
         "type": transaction_type or "SALE",
         "paymentMethod": payment_method or "CASH",
         "date": transaction_date.isoformat() if transaction_date else None,
@@ -258,12 +294,24 @@ def create_transaction():
         if quantity <= 0:
             return jsonify({"error": "quantity is required for purchase entries"}), 400
         if amount <= 0:
-            return jsonify({"error": "amount paid is required for purchase entries"}), 400
+            return jsonify({"error": "total cost is required for purchase entries"}), 400
     elif amount <= 0:
         return jsonify({"error": "amount must be greater than 0"}), 400
 
     tx_date = parse_date(payload.get("date"))
     note = str(payload.get("note", "")).strip()
+
+    # amount_paid: how much of a PURCHASE's total cost was actually paid now. Defaults
+    # to the full amount (preserving old "always fully paid" behavior) when the
+    # frontend doesn't send it; SALE/WASTAGE have no due concept, so always "paid".
+    if tx_type == "PURCHASE" and "amountPaid" in payload:
+        amount_paid = to_decimal(payload.get("amountPaid"))
+        if amount_paid < 0:
+            amount_paid = Decimal("0")
+        if amount_paid > amount:
+            amount_paid = amount
+    else:
+        amount_paid = amount
 
     try:
         with get_db_connection() as conn:
@@ -279,15 +327,16 @@ def create_transaction():
 
                 if tx_type == "WASTAGE" and amount <= 0:
                     amount = (quantity * cost_price) if cost_price else Decimal("0")
+                    amount_paid = amount
 
                 cur.execute(
                     """
                     INSERT INTO inventory_transactions
-                        (owner_id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, created_at
+                        (owner_id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, amount_paid)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, created_at, amount_paid
                     """,
-                    (owner_id, product_id, product_name, quantity, product_unit, amount, tx_type, payment_method, tx_date, note),
+                    (owner_id, product_id, product_name, quantity, product_unit, amount, tx_type, payment_method, tx_date, note, amount_paid),
                 )
                 transaction = serialize_transaction(cur.fetchone())
 
@@ -327,6 +376,414 @@ def delete_transaction(transaction_id):
         return jsonify({"message": "Transaction deleted"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.get("/vendors")
+def list_vendors():
+    """One row per vendor the owner has ever bought from, paid, or added a contact
+    profile for - with running totals. Powers the Vendors tab's passbook list."""
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                vendors = {}
+
+                def _get_or_create(name):
+                    key = name.strip().lower()
+                    if key not in vendors:
+                        vendors[key] = {
+                            "vendorName": name.strip(), "totalCost": 0.0, "totalPaid": 0.0,
+                            "lastActivity": None, "purchaseCount": 0, "mobileNumber": "", "email": "",
+                        }
+                    return vendors[key]
+
+                cur.execute(
+                    """
+                    SELECT note, COALESCE(SUM(amount), 0), COALESCE(SUM(amount_paid), 0), MAX(transaction_date), COUNT(*)
+                    FROM inventory_transactions
+                    WHERE owner_id = %s AND transaction_type = 'PURCHASE' AND note IS NOT NULL AND note != ''
+                    GROUP BY note
+                    """,
+                    (owner_id,),
+                )
+                for name, total_cost, total_paid_at_purchase, last_date, purchase_count in cur.fetchall():
+                    v = _get_or_create(name)
+                    v["totalCost"] += float(total_cost or 0)
+                    v["totalPaid"] += float(total_paid_at_purchase or 0)
+                    v["purchaseCount"] += purchase_count
+                    last_iso = last_date.isoformat() if last_date else None
+                    if last_iso and (not v["lastActivity"] or last_iso > v["lastActivity"]):
+                        v["lastActivity"] = last_iso
+
+                cur.execute(
+                    """
+                    SELECT vendor_name, COALESCE(SUM(amount), 0), MAX(payment_date)
+                    FROM inventory_vendor_payments
+                    WHERE owner_id = %s
+                    GROUP BY vendor_name
+                    """,
+                    (owner_id,),
+                )
+                for name, total_followup, last_date in cur.fetchall():
+                    v = _get_or_create(name)
+                    v["totalPaid"] += float(total_followup or 0)
+                    last_iso = last_date.isoformat() if last_date else None
+                    if last_iso and (not v["lastActivity"] or last_iso > v["lastActivity"]):
+                        v["lastActivity"] = last_iso
+
+                cur.execute(
+                    "SELECT name, mobile_number, email FROM inventory_vendors WHERE owner_id = %s",
+                    (owner_id,),
+                )
+                for name, mobile_number, email in cur.fetchall():
+                    v = _get_or_create(name)
+                    v["vendorName"] = name.strip()
+                    v["mobileNumber"] = mobile_number or ""
+                    v["email"] = email or ""
+
+        result = []
+        for v in vendors.values():
+            v["totalDue"] = round(v["totalCost"] - v["totalPaid"], 2)
+            result.append(v)
+        result.sort(key=lambda v: (-v["totalDue"], v["vendorName"] or ""))
+        return jsonify({"vendors": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.post("/vendors")
+def create_vendor():
+    """Lets the owner add a vendor's contact details proactively, before any
+    purchase from them exists."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    name = str(payload.get("name", "")).strip()
+    mobile_number = str(payload.get("mobileNumber", "")).strip()
+    email = str(payload.get("email", "")).strip()
+    address = str(payload.get("address", "")).strip()
+
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if not name:
+        return jsonify({"error": "Vendor name is required"}), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO inventory_vendors (owner_id, name, mobile_number, email, address)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (owner_id, lower(name)) DO UPDATE
+                        SET mobile_number = EXCLUDED.mobile_number, email = EXCLUDED.email,
+                            address = EXCLUDED.address, updated_at = NOW()
+                    RETURNING id, name, mobile_number, email, address
+                    """,
+                    (owner_id, name, mobile_number, email, address),
+                )
+                row = cur.fetchone()
+                conn.commit()
+        return jsonify({
+            "vendor": {
+                "id": str(row[0]), "name": row[1], "mobileNumber": row[2] or "",
+                "email": row[3] or "", "address": row[4] or "",
+            }
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.get("/vendor-ledger")
+def get_vendor_ledger():
+    """All purchases from, and payments made to, one vendor - with running totals so
+    the owner can see exactly how much they still owe that vendor."""
+    owner_id = get_owner_id()
+    vendor_name = str(request.args.get("vendor", "")).strip()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    if not vendor_name:
+        return jsonify({"error": "vendor is required"}), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT mobile_number, email, address FROM inventory_vendors WHERE owner_id = %s AND lower(name) = lower(%s)",
+                    (owner_id, vendor_name),
+                )
+                profile_row = cur.fetchone()
+                mobile_number, email, address = profile_row if profile_row else ("", "", "")
+
+                cur.execute(
+                    """
+                    SELECT id, product_name, quantity, unit, amount, amount_paid, transaction_date, created_at
+                    FROM inventory_transactions
+                    WHERE owner_id = %s AND transaction_type = 'PURCHASE' AND note = %s
+                    ORDER BY transaction_date DESC, created_at DESC
+                    """,
+                    (owner_id, vendor_name),
+                )
+                purchases = []
+                total_cost = Decimal("0")
+                total_paid_at_purchase = Decimal("0")
+                for (pid, product_name, quantity, unit, amount, amount_paid, tx_date, created_at) in cur.fetchall():
+                    amount = amount or Decimal("0")
+                    amount_paid = amount_paid or Decimal("0")
+                    total_cost += amount
+                    total_paid_at_purchase += amount_paid
+                    purchases.append({
+                        "id": str(pid),
+                        "productName": product_name,
+                        "quantity": float(quantity or 0),
+                        "unit": unit,
+                        "totalCost": float(amount),
+                        "amountPaid": float(amount_paid),
+                        "amountDue": float(amount - amount_paid),
+                        "date": tx_date.isoformat() if tx_date else None,
+                    })
+
+                cur.execute(
+                    """
+                    SELECT id, amount, payment_method, payment_date, note, created_at
+                    FROM inventory_vendor_payments
+                    WHERE owner_id = %s AND vendor_name = %s
+                    ORDER BY payment_date DESC, created_at DESC
+                    """,
+                    (owner_id, vendor_name),
+                )
+                payments = []
+                total_followup_paid = Decimal("0")
+                for (pid, amount, payment_method, pay_date, note, created_at) in cur.fetchall():
+                    amount = amount or Decimal("0")
+                    total_followup_paid += amount
+                    payments.append({
+                        "id": str(pid),
+                        "amount": float(amount),
+                        "paymentMethod": payment_method,
+                        "date": pay_date.isoformat() if pay_date else None,
+                        "note": note or "",
+                    })
+
+        total_paid = total_paid_at_purchase + total_followup_paid
+        return jsonify({
+            "vendorName": vendor_name,
+            "mobileNumber": mobile_number or "",
+            "email": email or "",
+            "address": address or "",
+            "purchases": purchases,
+            "payments": payments,
+            "totals": {
+                "totalCost": float(total_cost),
+                "totalPaid": float(total_paid),
+                "totalDue": float(total_cost - total_paid),
+            },
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.post("/vendor-payments")
+def create_vendor_payment():
+    """Records a follow-up payment to a vendor, reducing their outstanding due
+    balance without being tied to any single purchase line item."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    vendor_name = str(payload.get("vendorName", "")).strip()
+    amount = to_decimal(payload.get("amount"))
+    payment_method = str(payload.get("paymentMethod", "CASH")).strip().upper()
+    if payment_method not in ("CASH", "UPI", "CREDIT"):
+        payment_method = "CASH"
+    note = str(payload.get("note", "")).strip()
+    pay_date = parse_date(payload.get("date"))
+
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if not vendor_name:
+        return jsonify({"error": "vendorName is required"}), 400
+    if amount <= 0:
+        return jsonify({"error": "amount must be greater than 0"}), 400
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO inventory_vendor_payments (owner_id, vendor_name, amount, payment_method, payment_date, note)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id, vendor_name, amount, payment_method, payment_date, note, created_at
+                    """,
+                    (owner_id, vendor_name, amount, payment_method, pay_date, note),
+                )
+                row = cur.fetchone()
+                conn.commit()
+        return jsonify({
+            "payment": {
+                "id": str(row[0]),
+                "vendorName": row[1],
+                "amount": float(row[2] or 0),
+                "paymentMethod": row[3],
+                "date": row[4].isoformat() if row[4] else None,
+                "note": row[5] or "",
+            }
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.post("/voice-agent")
+def voice_agent():
+    """Transcribes a short voice note from a Fruit Seller-style inventory owner and figures
+    out whether they're adding a new product or recording a sale/purchase/wastage, e.g.
+    'add new product mango, 50 rupees per kg' or 'sold 3 kg apple for 200 cash'.
+    Never writes to the database itself - the app shows the parsed result in the existing
+    Add Product / Record Sale form for the owner to review and save, same as manual entry."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    audio_base64 = str(payload.get("audioBase64", ""))
+    mime_type = str(payload.get("mimeType", "audio/m4a")).strip() or "audio/m4a"
+
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if not audio_base64:
+        return jsonify({"error": "audioBase64 is required"}), 400
+    if len(audio_base64) > MAX_VOICE_AUDIO_CHARS:
+        return jsonify({"error": "Recording is too long. Please keep it under a few seconds."}), 200
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({
+            "error": "Voice logging isn't set up yet. Ask the app owner to add a free GEMINI_API_KEY "
+                     "(from aistudio.google.com/apikey) to the backend configuration to enable it."
+        }), 200
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, unit FROM inventory_products WHERE owner_id = %s AND status = 'active' ORDER BY name ASC",
+                    (owner_id,),
+                )
+                existing_products = cur.fetchall()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    product_list_text = (
+        ", ".join(f"{name} ({unit})" for name, unit in existing_products)
+        if existing_products else "(no products yet)"
+    )
+
+    system_prompt = (
+        "You are a voice assistant for a small fruit/vegetable seller's inventory app. The owner "
+        "says something short in English, Hindi, or Marathi, about either (a) adding a brand new "
+        "product to their catalog, or (b) recording a sale, purchase (restock), or wastage of a "
+        "product they already sell. Examples: 'add new product mango, cost forty rupees per kg, "
+        "selling price sixty', 'naya item kela, pachees rupaye kilo', 'sold 3 kg apple for 200 "
+        "rupees cash', 'bought 10 kg onion for 150 upi', '2 kg tomato kharab ho gaya'.\n\n"
+        f"The owner's EXISTING active products are: {product_list_text}.\n\n"
+        "Listen to the audio and reply with STRICT JSON only - no markdown fences, no explanation - "
+        "in exactly this shape:\n"
+        '{"intent": "add_product" or "record_transaction" or "unclear", '
+        '"transcript": "<what you heard, in the original language>", '
+        '"product": {"name": <string or null>, "unit": "kg" or "piece" or "dozen" or "litre" or null, '
+        '"costPrice": <number or null>, "sellingPrice": <number or null>}, '
+        '"transaction": {"productName": <string or null, MUST be copied verbatim from the existing '
+        'products list above - never invent or guess a product name that is not in that list>, '
+        '"quantity": <number or null>, "amount": <number or null>, '
+        '"type": "SALE" or "PURCHASE" or "WASTAGE" or null, '
+        '"paymentMethod": "CASH" or "UPI" or "CREDIT" or null}}.\n\n'
+        'Set "intent" to "add_product" only if the owner is clearly describing a brand new product '
+        'not already in their list. Set it to "record_transaction" if they are describing a sale, '
+        'purchase/restock, or wastage of one of their EXISTING products - match it to the closest '
+        'name in the list (e.g. "tamatar" matches "Tomato"), and if there is no reasonable match, '
+        'set transaction.productName to null and intent to "unclear". If the audio is silent, '
+        'contains no intelligible speech, is just background noise, or you are not highly confident '
+        'about what was said, you MUST set intent to "unclear", transcript to an empty string, and '
+        'every field inside product/transaction to null - do NOT invent or guess plausible-sounding '
+        'values just because a field is expected. Only fill in the "product" object for add_product, '
+        'and only the "transaction" object for record_transaction - leave the other one with all '
+        "null fields. Never guess a number, name, or amount that wasn't actually said."
+    )
+
+    try:
+        reply_text = _call_gemini_audio(system_prompt, audio_base64, mime_type, api_key)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        print(f"Inventory voice agent HTTP error {e.code}: {err_body}")
+        return jsonify({"error": "Voice logging is unavailable right now. Please try again or enter it manually."}), 200
+    except Exception as e:
+        print(f"Inventory voice agent error: {e}")
+        return jsonify({"error": "Voice logging is unavailable right now. Please try again or enter it manually."}), 200
+
+    cleaned = reply_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        return jsonify({
+            "error": "Could not understand the recording. Please try again or enter it manually.",
+            "transcript": reply_text,
+        }), 200
+
+    intent = parsed.get("intent")
+    if intent not in ("add_product", "record_transaction"):
+        intent = "unclear"
+
+    def _num(value):
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    raw_product = parsed.get("product") or {}
+    product_name = raw_product.get("name")
+    product_out = {
+        "name": str(product_name).strip() if product_name else None,
+        "unit": raw_product.get("unit") if raw_product.get("unit") in ("kg", "piece", "dozen", "litre") else None,
+        "costPrice": _num(raw_product.get("costPrice")),
+        "sellingPrice": _num(raw_product.get("sellingPrice")),
+    }
+    if intent == "add_product" and not product_out["name"]:
+        intent = "unclear"
+
+    raw_tx = parsed.get("transaction") or {}
+    tx_product_name = raw_tx.get("productName")
+    matched_name = None
+    if tx_product_name:
+        tx_product_name_lower = str(tx_product_name).strip().lower()
+        for existing_name, _unit in existing_products:
+            if existing_name.strip().lower() == tx_product_name_lower:
+                matched_name = existing_name
+                break
+    tx_type = raw_tx.get("type")
+    if tx_type not in ("SALE", "PURCHASE", "WASTAGE"):
+        tx_type = None
+    payment_method = raw_tx.get("paymentMethod")
+    if payment_method not in ("CASH", "UPI", "CREDIT"):
+        payment_method = None
+    transaction_out = {
+        "productName": matched_name,
+        "quantity": _num(raw_tx.get("quantity")),
+        "amount": _num(raw_tx.get("amount")),
+        "type": tx_type,
+        "paymentMethod": payment_method,
+    }
+    if intent == "record_transaction" and not matched_name:
+        intent = "unclear"
+
+    return jsonify({
+        "intent": intent,
+        "transcript": parsed.get("transcript", ""),
+        "product": product_out,
+        "transaction": transaction_out,
+    })
 
 
 def _period_bounds(period, anchor):
@@ -372,7 +829,7 @@ def list_transactions():
 
                 cur.execute(
                     f"""
-                    SELECT id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, created_at
+                    SELECT id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, created_at, amount_paid
                     FROM inventory_transactions
                     WHERE owner_id = %s AND transaction_date BETWEEN %s AND %s {type_clause}
                     ORDER BY transaction_date DESC, created_at DESC
@@ -446,6 +903,7 @@ def list_transactions():
                 "purchaseValue": purchase_totals["amount"],
                 "purchaseQuantity": purchase_totals["quantity"],
                 "purchaseCount": purchase_totals["count"],
+                "netProfit": sale_totals["amount"] - purchase_totals["amount"] - wastage_totals["amount"],
                 "paymentMethodSplit": {
                     "cash": payment_totals.get("CASH", 0),
                     "upi": payment_totals.get("UPI", 0),

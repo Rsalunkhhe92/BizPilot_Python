@@ -372,6 +372,106 @@ def _is_driver_business(bt_lower):
     return any(k in bt_lower for k in ("auto", "driver", "rickshaw"))
 
 
+def _is_travel_business(bt_lower):
+    return "travel" in bt_lower or "bus" in bt_lower
+
+
+def _build_travel_context(cur, owner_id):
+    today = date.today()
+
+    cur.execute(
+        "SELECT COUNT(*) FROM travel_trips WHERE owner_id = %s AND status != 'cancelled' AND travel_date = %s",
+        (owner_id, today),
+    )
+    today_trip_count = cur.fetchone()[0]
+
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(b.fare) FILTER (WHERE b.payment_status = 'paid'), 0),
+               COALESCE(SUM(b.fare) FILTER (WHERE b.payment_status = 'pending'), 0),
+               COUNT(*) FILTER (WHERE b.payment_status = 'paid')
+        FROM travel_seat_bookings b
+        JOIN travel_trips t ON b.trip_id = t.id
+        WHERE t.owner_id = %s AND b.booked_at::date = %s
+        """,
+        (owner_id, today),
+    )
+    today_row = cur.fetchone()
+    today_revenue = float(today_row[0] or 0)
+    today_pending = float(today_row[1] or 0)
+    today_booking_count = today_row[2]
+
+    week_start = today - timedelta(days=6)
+    cur.execute(
+        """
+        SELECT b.booked_at::date, COALESCE(SUM(b.fare), 0)
+        FROM travel_seat_bookings b
+        JOIN travel_trips t ON b.trip_id = t.id
+        WHERE t.owner_id = %s AND b.payment_status = 'paid' AND b.booked_at::date BETWEEN %s AND %s
+        GROUP BY b.booked_at::date ORDER BY b.booked_at::date
+        """,
+        (owner_id, week_start, today),
+    )
+    last_7_days_daily_revenue = [{"date": r[0].isoformat(), "amount": float(r[1] or 0)} for r in cur.fetchall()]
+    last_7_days_total_revenue = sum(d["amount"] for d in last_7_days_daily_revenue)
+
+    def _sum_fuel(start_d, end_d):
+        cur.execute(
+            "SELECT COALESCE(SUM(total_cost), 0) FROM travel_fuel_logs WHERE owner_id = %s AND fuel_date BETWEEN %s AND %s",
+            (owner_id, start_d, end_d),
+        )
+        return float(cur.fetchone()[0] or 0)
+
+    def _sum_revenue(start_d, end_d):
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(b.fare), 0)
+            FROM travel_seat_bookings b
+            JOIN travel_trips t ON b.trip_id = t.id
+            WHERE t.owner_id = %s AND b.payment_status = 'paid' AND b.booked_at::date BETWEEN %s AND %s
+            """,
+            (owner_id, start_d, end_d),
+        )
+        return float(cur.fetchone()[0] or 0)
+
+    today_fuel_cost = _sum_fuel(today, today)
+    last_7_days_fuel_cost = _sum_fuel(week_start, today)
+
+    month_start = today.replace(day=1)
+    month_to_date_revenue = _sum_revenue(month_start, today)
+    month_to_date_fuel_cost = _sum_fuel(month_start, today)
+
+    cur.execute(
+        "SELECT COUNT(*) FROM travel_trips WHERE owner_id = %s AND status != 'cancelled' AND travel_date > %s",
+        (owner_id, today),
+    )
+    upcoming_trip_count = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM travel_vehicles WHERE owner_id = %s AND status = 'active'",
+        (owner_id,),
+    )
+    active_vehicle_count = cur.fetchone()[0]
+
+    return {
+        "businessType": "bus travel operator",
+        "today": today.isoformat(),
+        "todayTripCount": today_trip_count,
+        "todayBookingCount": today_booking_count,
+        "todayRevenue": today_revenue,
+        "todayPendingAmount": today_pending,
+        "todayFuelCost": today_fuel_cost,
+        "todayNetProfit": today_revenue - today_fuel_cost,
+        "last7DaysDailyRevenue": last_7_days_daily_revenue,
+        "last7DaysTotalRevenue": last_7_days_total_revenue,
+        "last7DaysFuelCost": last_7_days_fuel_cost,
+        "monthToDateRevenue": month_to_date_revenue,
+        "monthToDateFuelCost": month_to_date_fuel_cost,
+        "upcomingTripCount": upcoming_trip_count,
+        "activeVehicleCount": active_vehicle_count,
+    }
+
+
 def _resolve_business_context(cur, owner_id):
     """Looks up the owner's business type and builds their grounding data context.
     Returns (full_name, business_type, context), or None if the account doesn't exist."""
@@ -386,6 +486,8 @@ def _resolve_business_context(cur, owner_id):
         context = _build_inventory_context(cur, owner_id)
     elif "collection" in bt_lower:
         context = _build_collection_context(cur, owner_id)
+    elif _is_travel_business(bt_lower):
+        context = _build_travel_context(cur, owner_id)
     elif _is_driver_business(bt_lower):
         context = _build_driver_context(cur, owner_id)
     else:
