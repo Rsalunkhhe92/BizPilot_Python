@@ -11,6 +11,7 @@ from collection_api import collection_bp
 from collection_service import ensure_collection_schema, seed_collection_demo_data
 from inventory_api import inventory_bp
 from inventory_service import ensure_inventory_schema
+from auth_token import issue_token
 from assistant_api import assistant_bp, ensure_assistant_schema
 from building_api import building_bp
 from building_service import ensure_building_schema
@@ -520,6 +521,7 @@ def login():
 
     return jsonify(
         {
+            "token": issue_token(user[0]),
             "user": {
                 "id": user[0],
                 "fullName": user[1],
