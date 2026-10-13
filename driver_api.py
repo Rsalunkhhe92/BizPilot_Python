@@ -1012,6 +1012,8 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MERCHANT_SYNC_MIN_SECONDS = 8
 MAX_TRANSFER_ATTEMPTS = 5
 _last_merchant_sync = {}
+# Why the latest sync for an owner could not read his payments (None when it worked).
+_last_merchant_sync_error = {}
 
 MERCHANT_COLUMNS = (
     "legal_name, phone, email, pan_last4, bank_last4, ifsc, gateway_account_id, "
@@ -1573,6 +1575,7 @@ def _sync_merchant_payments(owner_id):
             try:
                 creds = _driver_creds(cur, owner_id)
             except KeysEncryptionNotConfigured:
+                _last_merchant_sync_error[owner_id] = "Server cannot read the saved Razorpay keys (encryption key missing or different)."
                 return
             cur.execute(
                 "SELECT gateway_qr_id FROM driver_merchant_accounts WHERE owner_id = %s AND gateway_qr_id IS NOT NULL "
@@ -1581,6 +1584,7 @@ def _sync_merchant_payments(owner_id):
             )
             row = cur.fetchone()
             if row:
+                _last_merchant_sync_error[owner_id] = None
                 try:
                     items = _razorpay_request(
                         "GET", f"/payments/qr_codes/{row[0]}/payments?count=100", creds=creds
@@ -1590,9 +1594,14 @@ def _sync_merchant_payments(owner_id):
                             _record_merchant_payment(cur, owner_id, row[0], payment, direct=bool(creds))
                     conn.commit()
                 except GatewayNotConfigured:
-                    pass
+                    _last_merchant_sync_error[owner_id] = "Payment gateway keys are not configured on the server."
+                except urllib.error.HTTPError as e:
+                    detail = _gateway_error_text(e)
+                    print(f"Razorpay merchant payment sync failed {e.code}: {detail}")
+                    _last_merchant_sync_error[owner_id] = f"Razorpay refused the request ({e.code}): {detail or 'no details'}"
                 except urllib.error.URLError as e:
                     print(f"Razorpay merchant payment sync failed: {e}")
+                    _last_merchant_sync_error[owner_id] = f"Server could not reach Razorpay: {e.reason}"
             cur.execute(
                 "SELECT id FROM driver_merchant_payments WHERE owner_id = %s "
                 "AND transfer_status IN ('PENDING', 'FAILED', 'SENDING') AND transfer_attempts < %s ORDER BY id LIMIT 10",
@@ -1692,6 +1701,7 @@ def list_merchant_payments():
             } for r in rows],
             "todayTotal": float(today_total),
             "todayCount": int(today_count),
+            "syncError": _last_merchant_sync_error.get(owner_id),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
