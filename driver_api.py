@@ -1169,15 +1169,16 @@ def get_merchant_account():
                 # Until the account is active with a QR, ask Razorpay where KYC review stands.
                 # A QR made with the other mode's keys (test vs live) is dead and is reissued.
                 creds = None
+                keys_unreadable = False
                 if row and row[14]:
                     try:
                         creds = _driver_creds(cur, owner_id)
                     except KeysEncryptionNotConfigured:
                         print("DRIVER_KEYS_ENCRYPTION_KEY is missing or does not match the stored driver keys")
-                        row = row[:9] + ("NEEDS_CLARIFICATION", "server key") + row[11:]
+                        keys_unreadable = True
                 has_keys = bool(creds) or (_gateway_configured() and not (row and row[14]))
                 needs_qr = bool(row) and has_keys and (not row[11] or row[13] != _gateway_mode(creds))
-                if row and (row[9] != "ACTIVATED" or needs_qr):
+                if row and not keys_unreadable and (row[9] != "ACTIVATED" or needs_qr):
                     try:
                         status = row[9]
                         if status != "ACTIVATED" and row[7]:
@@ -1192,6 +1193,9 @@ def get_merchant_account():
                     except urllib.error.URLError as e:
                         print(f"Razorpay linked account status check failed: {e}")
                 conn.commit()
+        if keys_unreadable:
+            # Reported, never stored: the saved keys are fine, this server just cannot open them.
+            row = row[:9] + ("NEEDS_CLARIFICATION", "server encryption key (DRIVER_KEYS_ENCRYPTION_KEY)") + row[11:]
         return jsonify({
             "account": serialize_merchant_account(row) if row else None,
             "gatewayConfigured": _own_keys_mode() or _gateway_configured(),
