@@ -42,21 +42,32 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 
 def _call_gemini_audio(system_prompt, audio_base64, mime_type, api_key):
     """Sends a short voice note to Gemini (multimodal) and returns its text reply."""
+    return _call_gemini_media(
+        system_prompt, audio_base64, mime_type, api_key,
+        "Listen to this audio and reply with the JSON described in your instructions.",
+    )
+
+
+def _call_gemini_media(system_prompt, media_base64, mime_type, api_key, instruction,
+                       max_output_tokens=300, timeout=30):
+    """Sends one audio clip or image to Gemini (multimodal) and returns its text reply."""
     url = GEMINI_API_URL.format(model=GEMINI_MODEL) + f"?key={api_key}"
     body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{
             "role": "user",
             "parts": [
-                {"inline_data": {"mime_type": mime_type, "data": audio_base64}},
-                {"text": "Listen to this audio and reply with the JSON described in your instructions."},
+                {"inline_data": {"mime_type": mime_type, "data": media_base64}},
+                {"text": instruction},
             ],
         }],
-        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.15, "thinkingConfig": {"thinkingBudget": 0}},
+        "generationConfig": {
+            "maxOutputTokens": max_output_tokens, "temperature": 0.15, "thinkingConfig": {"thinkingBudget": 0},
+        },
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     candidates = result.get("candidates", [])
     if not candidates:
@@ -255,6 +266,260 @@ def create_product():
         return jsonify({"product": product}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _product_name_key(name):
+    """Name used to spot a product that is already in the catalog: case and extra spaces ignored."""
+    return " ".join(str(name or "").split()).lower()
+
+
+def _given(value):
+    """Whether a bulk row actually supplied this number (blank means 'leave as it is')."""
+    return value not in (None, "")
+
+
+@inventory_bp.post("/products/bulk")
+def create_products_bulk():
+    """Saves many products in one request and one transaction: either all are saved or none.
+    A row whose name matches an active product already in the catalog updates that product
+    instead of creating a duplicate: its stock is added to (stockMode "add", the default) or
+    replaced (stockMode "replace"), and unit and prices change only where the row gives them."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    items = payload.get("products")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "products must be a non-empty list"}), 400
+    if len(items) > 200:
+        return jsonify({"error": "You can add at most 200 products at a time"}), 400
+    stock_mode = str(payload.get("stockMode", "add")).strip().lower()
+    if stock_mode not in ("add", "replace"):
+        return jsonify({"error": "stockMode must be 'add' or 'replace'"}), 400
+
+    rows = []
+    for index, item in enumerate(items, start=1):
+        item = item if isinstance(item, dict) else {}
+        name = " ".join(str(item.get("name", "")).split())
+        if not name:
+            return jsonify({"error": f"Row {index}: product name is required"}), 400
+        rows.append((name, item))
+
+    columns = """id, name, category, unit, stock_qty, selling_price, cost_price,
+                 low_stock_threshold, status, created_at, updated_at"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name FROM inventory_products WHERE owner_id = %s AND status = 'active' FOR UPDATE",
+                    (owner_id,),
+                )
+                existing = {_product_name_key(name): product_id for product_id, name in cur.fetchall()}
+
+                added, updated = [], []
+                for name, item in rows:
+                    key = _product_name_key(name)
+                    product_id = existing.get(key)
+                    if product_id is None:
+                        cur.execute(
+                            f"""
+                            INSERT INTO inventory_products
+                                (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            RETURNING {columns}
+                            """,
+                            (
+                                owner_id,
+                                name,
+                                str(item.get("category", "General")).strip() or "General",
+                                str(item.get("unit") or "").strip() or "kg",
+                                to_decimal(item.get("stockQty")),
+                                to_decimal(item.get("sellingPrice")),
+                                to_decimal(item.get("costPrice")),
+                                to_decimal(item.get("lowStockThreshold")),
+                            ),
+                        )
+                        product = serialize_product(cur.fetchone())
+                        # A later row with the same name in this upload updates this new product.
+                        existing[key] = int(product["id"])
+                        added.append(product)
+                        continue
+
+                    fields, values = [], []
+                    if _given(item.get("stockQty")):
+                        fields.append("stock_qty = stock_qty + %s" if stock_mode == "add" else "stock_qty = %s")
+                        values.append(to_decimal(item.get("stockQty")))
+                    if str(item.get("unit") or "").strip():
+                        fields.append("unit = %s")
+                        values.append(str(item.get("unit")).strip())
+                    if _given(item.get("sellingPrice")):
+                        fields.append("selling_price = %s")
+                        values.append(to_decimal(item.get("sellingPrice")))
+                    if _given(item.get("costPrice")):
+                        fields.append("cost_price = %s")
+                        values.append(to_decimal(item.get("costPrice")))
+                    fields.append("updated_at = NOW()")
+                    cur.execute(
+                        f"""
+                        UPDATE inventory_products SET {', '.join(fields)}
+                        WHERE id = %s AND owner_id = %s
+                        RETURNING {columns}
+                        """,
+                        (*values, product_id, owner_id),
+                    )
+                    product = serialize_product(cur.fetchone())
+                    if _given(item.get("sellingPrice")):
+                        _record_daily_rate(cur, owner_id, product_id, to_decimal(item.get("sellingPrice")))
+                    # The same name can appear twice in one upload; report each product once, as it ended up.
+                    if any(p["id"] == product["id"] for p in added):
+                        added = [product if p["id"] == product["id"] else p for p in added]
+                    else:
+                        updated = [p for p in updated if p["id"] != product["id"]] + [product]
+                conn.commit()
+        return jsonify({"added": added, "updated": updated, "products": added + updated}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+MAX_LIST_MEDIA_CHARS = 12_000_000  # ~9 MB of base64: a phone photo or a minute of speech
+
+
+def _to_number_or_none(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+@inventory_bp.post("/products/extract")
+def extract_products():
+    """Reads a product list from a photo (handwritten list, supplier bill, rate board) or a
+    spoken list, and returns rows for the Bulk Upload popup. Never writes to the database:
+    the owner reviews the rows and saves them through /products/bulk."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    source = str(payload.get("source", "")).strip().lower()
+    media_base64 = str(payload.get("mediaBase64", ""))
+    mime_type = str(payload.get("mimeType", "")).strip()
+
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if source not in ("image", "audio"):
+        return jsonify({"error": "source must be 'image' or 'audio'"}), 400
+    if not media_base64:
+        return jsonify({"error": "mediaBase64 is required"}), 400
+    if len(media_base64) > MAX_LIST_MEDIA_CHARS:
+        message = ("The photo is too large. Please try again with a smaller photo." if source == "image"
+                   else "Recording is too long. Please keep it under a minute.")
+        return jsonify({"error": message}), 200
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({
+            "error": "Scanning isn't set up yet. Ask the app owner to add a free GEMINI_API_KEY "
+                     "(from aistudio.google.com/apikey) to the backend configuration to enable it."
+        }), 200
+
+    # The owner's current products, so a row for one of them comes back with exactly the
+    # same name and the bulk save updates it instead of adding a duplicate.
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, unit FROM inventory_products WHERE owner_id = %s AND status = 'active' ORDER BY name ASC",
+                    (owner_id,),
+                )
+                existing_products = cur.fetchall()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    product_list_text = (
+        "; ".join(f"{name} ({unit})" for name, unit in existing_products)
+        if existing_products else "(no products yet)"
+    )
+
+    what = (
+        "a PHOTO of a product list - it may be handwritten, a printed supplier bill/invoice, "
+        "a rate board, or a screenshot - in English, Hindi, or Marathi"
+        if source == "image" else
+        "a VOICE NOTE where the owner speaks a list of products in English, Hindi, or Marathi, e.g. "
+        "'mango 50 kilo 120 rupaye, apple 30 kilo 150, kela 10 dozen 40 rupees'"
+    )
+    system_prompt = (
+        "You help a small shop owner (fruit/vegetable seller or retailer) add many products to their "
+        f"inventory app at once. You receive {what}.\n\n"
+        "Extract every product and reply with STRICT JSON only - no markdown fences, no explanation - "
+        "in exactly this shape:\n"
+        '{"transcript": "<for a voice note, what you heard in the original language; for a photo, an '
+        'empty string>", "products": [{"name": <string>, "unit": "kg" or "gram" or "litre" or "piece" '
+        'or "plate" or "dozen" or "packet" or "box" or "bunch" or null, "stockQty": <number or null>, "sellingPrice": <number '
+        'or null>, "costPrice": <number or null>}]}\n\n'
+        f"The owner's EXISTING products are: {product_list_text}.\n\n"
+        "Naming rules, in this order: (1) If an item is the same product as one in the EXISTING list - "
+        "even when spelled differently, abbreviated, or written in Hindi/Marathi (e.g. 'barik rava' or "
+        "'बारीक रवा' for an existing 'Barik rawa') - copy that existing name EXACTLY, character for "
+        "character. (2) Keep every qualifier that tells variants apart, such as barik/jada (fine/coarse), "
+        "chota/bada, size, grade, brand, or pack size: 'Barik rawa' and 'Jada rawa' are two DIFFERENT "
+        "products, never merge them or drop the qualifier, and never match an item to an existing "
+        "product with a different qualifier. (3) For a new product, use the common English name in "
+        "title case when there is one (e.g. 'kela' -> 'Banana', 'tamatar' -> 'Tomato', 'आंबा' -> "
+        "'Mango'), otherwise keep the name as written in Roman letters. (4) Unit: use the unit written or "
+        "said; if none, use \"piece\" for items sold by count (e.g. vada pav, samosa, eggs, bread, "
+        "coconut), \"plate\" for food served by the plate, and null if unsure. For an EXISTING product "
+        "with no unit given, use null so its unit is left unchanged.\n\n"
+        "On a supplier bill the per-unit rate the shop PAYS is costPrice and the quantity "
+        "bought is stockQty; ignore line totals, taxes, discounts, and grand totals. A single price "
+        "with no clear meaning on a rate board or in speech is sellingPrice. Merge an item only with "
+        "an exact repeat of the same product. "
+        "Never guess a number that is not written or said - use null. If there is no readable product "
+        'list at all, return {"transcript": "", "products": []}.'
+    )
+    instruction = (
+        "Read the product list in this photo and reply with the JSON described in your instructions."
+        if source == "image" else
+        "Listen to this audio and reply with the JSON described in your instructions."
+    )
+    fail_message = "Could not read the list right now. Please try again or type the products."
+
+    try:
+        reply_text = _call_gemini_media(
+            system_prompt, media_base64, mime_type or ("image/jpeg" if source == "image" else "audio/mp4"),
+            api_key, instruction, max_output_tokens=8192, timeout=60,
+        )
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        print(f"Product list extract HTTP error {e.code}: {err_body}")
+        return jsonify({"error": fail_message}), 200
+    except Exception as e:
+        print(f"Product list extract error: {e}")
+        return jsonify({"error": fail_message}), 200
+
+    cleaned = reply_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        return jsonify({"error": fail_message}), 200
+
+    products = []
+    for item in parsed.get("products") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        products.append({
+            "name": name[:120],
+            "unit": str(item.get("unit") or "").strip() or None,
+            "stockQty": _to_number_or_none(item.get("stockQty")),
+            "sellingPrice": _to_number_or_none(item.get("sellingPrice")),
+            "costPrice": _to_number_or_none(item.get("costPrice")),
+        })
+    return jsonify({"transcript": str(parsed.get("transcript") or ""), "products": products[:200]})
 
 
 @inventory_bp.put("/products/<int:product_id>")
