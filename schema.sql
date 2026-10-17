@@ -83,7 +83,11 @@ INSERT INTO business_types (name) VALUES
     ('Mechanics'),
     ('Small retailers'),
     ('Collection'),
-    ('Other local businesses')
+    ('Other local businesses'),
+    ('Kirana stores'),
+    ('Shoe shops'),
+    ('Mobile shops'),
+    ('Medical stores')
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO subscriptions (plan_name, plan_amount, status, start_date, end_date)

@@ -55,6 +55,14 @@ DEFAULT_BUSINESS_FEATURES = {
     "Vegetable seller": ["products", "inventory", "purchases", "sales"],
     "Small retailers": ["products", "inventory", "sales", "purchases"],
     "Small retailer": ["products", "inventory", "sales", "purchases"],
+    "Kirana stores": ["products", "inventory", "sales", "purchases"],
+    "Kirana store": ["products", "inventory", "sales", "purchases"],
+    "Shoe shops": ["products", "inventory", "sales", "purchases"],
+    "Shoe shop": ["products", "inventory", "sales", "purchases"],
+    "Mobile shops": ["products", "inventory", "sales", "purchases"],
+    "Mobile shop": ["products", "inventory", "sales", "purchases"],
+    "Medical stores": ["products", "inventory", "sales", "purchases"],
+    "Medical store": ["products", "inventory", "sales", "purchases"],
     "Mechanics": ["service_jobs", "vehicle_customer", "spare_parts", "job_status"],
     "Mechanic": ["service_jobs", "vehicle_customer", "spare_parts", "job_status"],
     "Collection": ["collection_records", "due_amount", "payment_collection"],
@@ -229,6 +237,15 @@ def ensure_schema_compatibility():
 
                 # Provision Inventory Business Schema (Fruit Sellers / product-based businesses)
                 ensure_inventory_schema(cursor)
+                # Product shops the Product Sheet has default products for; existing names are left alone.
+                cursor.execute("""
+                    INSERT INTO business_types (name, description) VALUES
+                        ('Kirana stores', 'Grocery and daily-needs stores'),
+                        ('Shoe shops', 'Footwear shops'),
+                        ('Mobile shops', 'Mobile phone and accessories shops'),
+                        ('Medical stores', 'Pharmacies and medical stores')
+                    ON CONFLICT (name) DO NOTHING
+                """)
 
                 # Provision AI Assistant Schema (chatbot + proactive daily summary cache)
                 ensure_assistant_schema(cursor)

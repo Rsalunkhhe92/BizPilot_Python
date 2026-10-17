@@ -16,6 +16,7 @@ from flask import Blueprint, jsonify, request
 import psycopg
 
 from auth_token import verify_token
+from product_sheets import SheetFileError, build_sheets, build_workbook_base64, parse_workbook_base64
 
 inventory_bp = Blueprint("inventory", __name__, url_prefix="/api/inventory")
 
@@ -42,32 +43,21 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 
 def _call_gemini_audio(system_prompt, audio_base64, mime_type, api_key):
     """Sends a short voice note to Gemini (multimodal) and returns its text reply."""
-    return _call_gemini_media(
-        system_prompt, audio_base64, mime_type, api_key,
-        "Listen to this audio and reply with the JSON described in your instructions.",
-    )
-
-
-def _call_gemini_media(system_prompt, media_base64, mime_type, api_key, instruction,
-                       max_output_tokens=300, timeout=30):
-    """Sends one audio clip or image to Gemini (multimodal) and returns its text reply."""
     url = GEMINI_API_URL.format(model=GEMINI_MODEL) + f"?key={api_key}"
     body = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{
             "role": "user",
             "parts": [
-                {"inline_data": {"mime_type": mime_type, "data": media_base64}},
-                {"text": instruction},
+                {"inline_data": {"mime_type": mime_type, "data": audio_base64}},
+                {"text": "Listen to this audio and reply with the JSON described in your instructions."},
             ],
         }],
-        "generationConfig": {
-            "maxOutputTokens": max_output_tokens, "temperature": 0.15, "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.15, "thinkingConfig": {"thinkingBudget": 0}},
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     candidates = result.get("candidates", [])
     if not candidates:
@@ -381,145 +371,67 @@ def create_products_bulk():
         return jsonify({"error": str(e)}), 500
 
 
-MAX_LIST_MEDIA_CHARS = 12_000_000  # ~9 MB of base64: a phone photo or a minute of speech
+def _load_sheets(owner_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT business_type FROM userdetails WHERE id = %s", (owner_id,))
+            row = cur.fetchone()
+            cur.execute(
+                """
+                SELECT id, name, category, unit, stock_qty, selling_price, cost_price,
+                       low_stock_threshold, status, created_at, updated_at
+                FROM inventory_products
+                WHERE owner_id = %s AND status = 'active'
+                ORDER BY name ASC
+                """,
+                (owner_id,),
+            )
+            products = [serialize_product(r) for r in cur.fetchall()]
+    return build_sheets(row[0] if row else "", products)
 
 
-def _to_number_or_none(value):
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number >= 0 else None
-
-
-@inventory_bp.post("/products/extract")
-def extract_products():
-    """Reads a product list from a photo (handwritten list, supplier bill, rate board) or a
-    spoken list, and returns rows for the Bulk Upload popup. Never writes to the database:
-    the owner reviews the rows and saves them through /products/bulk."""
-    payload = request.get_json(silent=True) or {}
-    owner_id = get_owner_id(payload)
-    source = str(payload.get("source", "")).strip().lower()
-    media_base64 = str(payload.get("mediaBase64", ""))
-    mime_type = str(payload.get("mimeType", "")).strip()
-
+@inventory_bp.get("/product-sheets")
+def get_product_sheets():
+    """The Product Sheet: one sheet per kind of shop with common products, plus the owner's own."""
+    owner_id = get_owner_id()
     if not owner_id:
-        return jsonify({"error": "ownerId is required"}), 400
-    if source not in ("image", "audio"):
-        return jsonify({"error": "source must be 'image' or 'audio'"}), 400
-    if not media_base64:
-        return jsonify({"error": "mediaBase64 is required"}), 400
-    if len(media_base64) > MAX_LIST_MEDIA_CHARS:
-        message = ("The photo is too large. Please try again with a smaller photo." if source == "image"
-                   else "Recording is too long. Please keep it under a minute.")
-        return jsonify({"error": message}), 200
-
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return jsonify({
-            "error": "Scanning isn't set up yet. Ask the app owner to add a free GEMINI_API_KEY "
-                     "(from aistudio.google.com/apikey) to the backend configuration to enable it."
-        }), 200
-
-    # The owner's current products, so a row for one of them comes back with exactly the
-    # same name and the bulk save updates it instead of adding a duplicate.
+        return jsonify({"error": "owner_id is required"}), 400
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT name, unit FROM inventory_products WHERE owner_id = %s AND status = 'active' ORDER BY name ASC",
-                    (owner_id,),
-                )
-                existing_products = cur.fetchall()
+        return jsonify({"sheets": _load_sheets(owner_id)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    product_list_text = (
-        "; ".join(f"{name} ({unit})" for name, unit in existing_products)
-        if existing_products else "(no products yet)"
-    )
 
-    what = (
-        "a PHOTO of a product list - it may be handwritten, a printed supplier bill/invoice, "
-        "a rate board, or a screenshot - in English, Hindi, or Marathi"
-        if source == "image" else
-        "a VOICE NOTE where the owner speaks a list of products in English, Hindi, or Marathi, e.g. "
-        "'mango 50 kilo 120 rupaye, apple 30 kilo 150, kela 10 dozen 40 rupees'"
-    )
-    system_prompt = (
-        "You help a small shop owner (fruit/vegetable seller or retailer) add many products to their "
-        f"inventory app at once. You receive {what}.\n\n"
-        "Extract every product and reply with STRICT JSON only - no markdown fences, no explanation - "
-        "in exactly this shape:\n"
-        '{"transcript": "<for a voice note, what you heard in the original language; for a photo, an '
-        'empty string>", "products": [{"name": <string>, "unit": "kg" or "gram" or "litre" or "piece" '
-        'or "plate" or "dozen" or "packet" or "box" or "bunch" or null, "stockQty": <number or null>, "sellingPrice": <number '
-        'or null>, "costPrice": <number or null>}]}\n\n'
-        f"The owner's EXISTING products are: {product_list_text}.\n\n"
-        "Naming rules, in this order: (1) If an item is the same product as one in the EXISTING list - "
-        "even when spelled differently, abbreviated, or written in Hindi/Marathi (e.g. 'barik rava' or "
-        "'बारीक रवा' for an existing 'Barik rawa') - copy that existing name EXACTLY, character for "
-        "character. (2) Keep every qualifier that tells variants apart, such as barik/jada (fine/coarse), "
-        "chota/bada, size, grade, brand, or pack size: 'Barik rawa' and 'Jada rawa' are two DIFFERENT "
-        "products, never merge them or drop the qualifier, and never match an item to an existing "
-        "product with a different qualifier. (3) For a new product, use the common English name in "
-        "title case when there is one (e.g. 'kela' -> 'Banana', 'tamatar' -> 'Tomato', 'आंबा' -> "
-        "'Mango'), otherwise keep the name as written in Roman letters. (4) Unit: use the unit written or "
-        "said; if none, use \"piece\" for items sold by count (e.g. vada pav, samosa, eggs, bread, "
-        "coconut), \"plate\" for food served by the plate, and null if unsure. For an EXISTING product "
-        "with no unit given, use null so its unit is left unchanged.\n\n"
-        "On a supplier bill the per-unit rate the shop PAYS is costPrice and the quantity "
-        "bought is stockQty; ignore line totals, taxes, discounts, and grand totals. A single price "
-        "with no clear meaning on a rate board or in speech is sellingPrice. Merge an item only with "
-        "an exact repeat of the same product. "
-        "Never guess a number that is not written or said - use null. If there is no readable product "
-        'list at all, return {"transcript": "", "products": []}.'
-    )
-    instruction = (
-        "Read the product list in this photo and reply with the JSON described in your instructions."
-        if source == "image" else
-        "Listen to this audio and reply with the JSON described in your instructions."
-    )
-    fail_message = "Could not read the list right now. Please try again or type the products."
 
+@inventory_bp.get("/product-sheets/xlsx")
+def download_product_sheets():
+    """The same sheets as an .xlsx file (base64), to fill in Excel / Google Sheets."""
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
     try:
-        reply_text = _call_gemini_media(
-            system_prompt, media_base64, mime_type or ("image/jpeg" if source == "image" else "audio/mp4"),
-            api_key, instruction, max_output_tokens=8192, timeout=60,
-        )
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        print(f"Product list extract HTTP error {e.code}: {err_body}")
-        return jsonify({"error": fail_message}), 200
+        file_base64 = build_workbook_base64(_load_sheets(owner_id))
+        return jsonify({"fileName": f"products-{date.today().isoformat()}.xlsx", "fileBase64": file_base64})
     except Exception as e:
-        print(f"Product list extract error: {e}")
-        return jsonify({"error": fail_message}), 200
+        return jsonify({"error": str(e)}), 500
 
-    cleaned = reply_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned[:4].lower() == "json":
-            cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
+
+@inventory_bp.post("/product-sheets/parse")
+def parse_product_sheets():
+    """Reads an uploaded .xlsx into sheets for the owner to review. Saves nothing."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    file_base64 = str(payload.get("fileBase64", ""))
+    if not file_base64:
+        return jsonify({"error": "fileBase64 is required"}), 400
     try:
-        parsed = json.loads(cleaned)
-    except (json.JSONDecodeError, TypeError):
-        return jsonify({"error": fail_message}), 200
-
-    products = []
-    for item in parsed.get("products") or []:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        if not name:
-            continue
-        products.append({
-            "name": name[:120],
-            "unit": str(item.get("unit") or "").strip() or None,
-            "stockQty": _to_number_or_none(item.get("stockQty")),
-            "sellingPrice": _to_number_or_none(item.get("sellingPrice")),
-            "costPrice": _to_number_or_none(item.get("costPrice")),
-        })
-    return jsonify({"transcript": str(parsed.get("transcript") or ""), "products": products[:200]})
+        return jsonify({"sheets": parse_workbook_base64(file_base64)})
+    except SheetFileError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        print(f"Product sheet parse error: {e}")
+        return jsonify({"error": "The file could not be read."}), 400
 
 
 @inventory_bp.put("/products/<int:product_id>")
@@ -2083,15 +1995,17 @@ def get_insights():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                # Top selling products (last 30 days, by amount)
+                # Top selling products (last 30 days, by amount). Only products still in the
+                # catalog, under their current name (deleted products are left out).
                 cur.execute(
                     """
-                    SELECT product_name, COALESCE(SUM(amount), 0), COALESCE(SUM(quantity), 0)
-                    FROM inventory_transactions
-                    WHERE owner_id = %s AND transaction_date >= CURRENT_DATE - INTERVAL '30 days'
-                        AND transaction_type = 'SALE'
-                    GROUP BY product_name
-                    ORDER BY SUM(amount) DESC
+                    SELECT p.name, COALESCE(SUM(t.amount), 0), COALESCE(SUM(t.quantity), 0)
+                    FROM inventory_transactions t
+                    JOIN inventory_products p ON p.id = t.product_id AND p.owner_id = t.owner_id AND p.status = 'active'
+                    WHERE t.owner_id = %s AND t.transaction_date >= CURRENT_DATE - INTERVAL '30 days'
+                        AND t.transaction_type = 'SALE'
+                    GROUP BY p.id, p.name
+                    ORDER BY SUM(t.amount) DESC
                     LIMIT 8
                     """,
                     (owner_id,),
@@ -2101,15 +2015,17 @@ def get_insights():
                     for r in cur.fetchall()
                 ]
 
-                # Most wasted products (last 30 days, by lost value)
+                # Most wasted products (last 30 days, by lost value). Only products still in the
+                # catalog, under their current name (deleted products are left out).
                 cur.execute(
                     """
-                    SELECT product_name, COALESCE(SUM(amount), 0), COALESCE(SUM(quantity), 0)
-                    FROM inventory_transactions
-                    WHERE owner_id = %s AND transaction_date >= CURRENT_DATE - INTERVAL '30 days'
-                        AND transaction_type = 'WASTAGE'
-                    GROUP BY product_name
-                    ORDER BY SUM(amount) DESC
+                    SELECT p.name, COALESCE(SUM(t.amount), 0), COALESCE(SUM(t.quantity), 0)
+                    FROM inventory_transactions t
+                    JOIN inventory_products p ON p.id = t.product_id AND p.owner_id = t.owner_id AND p.status = 'active'
+                    WHERE t.owner_id = %s AND t.transaction_date >= CURRENT_DATE - INTERVAL '30 days'
+                        AND t.transaction_type = 'WASTAGE'
+                    GROUP BY p.id, p.name
+                    ORDER BY SUM(t.amount) DESC
                     LIMIT 8
                     """,
                     (owner_id,),
