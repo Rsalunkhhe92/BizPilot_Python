@@ -17,6 +17,8 @@ from building_api import building_bp
 from building_service import ensure_building_schema
 from driver_api import driver_bp, ensure_driver_schema
 from travel_api import travel_bp, ensure_travel_schema
+from bachatgat_api import bachatgat_bp
+from bachatgat_service import BACHAT_GAT_FEATURES, ensure_bachatgat_schema
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -28,6 +30,7 @@ app.register_blueprint(assistant_bp)
 app.register_blueprint(building_bp)
 app.register_blueprint(driver_bp)
 app.register_blueprint(travel_bp)
+app.register_blueprint(bachatgat_bp)
 WEB_DIRECTORY = os.path.join(os.path.dirname(__file__), "web")
 VALID_USER_TYPES = {"admin", "customer"}
 VALID_PLAN_TYPES = {"monthly", "quarterly", "yearly"}
@@ -71,6 +74,7 @@ DEFAULT_BUSINESS_FEATURES = {
     "Travels Bus Booking Online": ["online_booking", "vehicle", "trips", "fuel"],
     "Travels Online Booking": ["online_booking", "vehicle", "trips", "fuel"],
     "Travels": ["online_booking", "vehicle", "trips", "fuel"],
+    "Mahila Bachat Gat": BACHAT_GAT_FEATURES,
     "Other local businesses": ["ledger", "dues"],
 }
 
@@ -262,6 +266,21 @@ try:
     ensure_schema_compatibility()
 except Exception:
     pass
+
+
+def ensure_bachatgat_tables():
+    """Mahila Bachat Gat (SHG) schema in its own transaction, so a problem here
+    can never roll back the other business types' schema provisioning."""
+    try:
+        with psycopg.connect(get_database_url()) as connection:
+            with connection.cursor() as cursor:
+                ensure_bachatgat_schema(cursor)
+            connection.commit()
+    except Exception as e:
+        print(f"Bachat Gat schema notice: {e}")
+
+
+ensure_bachatgat_tables()
 
 
 def create_admin_notification(cursor, category, notification_type, title, message, customer_id=None, customer_name=None, action_url=None):

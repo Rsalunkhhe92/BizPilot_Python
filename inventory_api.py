@@ -16,7 +16,7 @@ from flask import Blueprint, jsonify, request
 import psycopg
 
 from auth_token import verify_token
-from product_sheets import SheetFileError, build_sheets, build_workbook_base64, parse_workbook_base64
+from product_sheets import SheetFileError, build_sheets, build_workbook_base64, parse_workbook_base64, suggested_category
 
 inventory_bp = Blueprint("inventory", __name__, url_prefix="/api/inventory")
 
@@ -231,7 +231,7 @@ def create_product():
     if not name:
         return jsonify({"error": "Product name is required"}), 400
 
-    category = str(payload.get("category", "General")).strip() or "General"
+    category = suggested_category(name, payload.get("category"))
     unit = str(payload.get("unit", "kg")).strip() or "kg"
     stock_qty = to_decimal(payload.get("stockQty"))
     selling_price = to_decimal(payload.get("sellingPrice"))
@@ -321,7 +321,7 @@ def create_products_bulk():
                             (
                                 owner_id,
                                 name,
-                                str(item.get("category", "General")).strip() or "General",
+                                suggested_category(name, item.get("category")),
                                 str(item.get("unit") or "").strip() or "kg",
                                 to_decimal(item.get("stockQty")),
                                 to_decimal(item.get("sellingPrice")),
@@ -512,6 +512,57 @@ def delete_product(product_id):
                     return jsonify({"error": "Product not found"}), 404
                 conn.commit()
         return jsonify({"message": "Product removed"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.post("/vendor-bills")
+def create_vendor_bill():
+    """'Other' on Daily Collection: an amount owed to a vendor with no product (transport,
+    crates, commission...). It raises the vendor's dues like an unpaid purchase and is paid
+    off with the normal vendor payments; it never changes stock, sales or the purchase totals."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    vendor_name = str(payload.get("vendorName", "")).strip()
+    description = str(payload.get("description", "")).strip()[:150] or "Other charges"
+    amount = to_decimal(payload.get("amount"))
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    if not vendor_name:
+        return jsonify({"error": "Choose or enter the vendor name"}), 400
+    if len(vendor_name) > 150:
+        return jsonify({"error": "Vendor name is too long"}), 400
+    if amount <= 0:
+        return jsonify({"error": "Amount must be greater than 0"}), 400
+    tx_date = parse_date(payload.get("date"))
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Use the vendor's existing spelling so the bill lands in the same ledger.
+                cur.execute(
+                    """SELECT name FROM (
+                           SELECT name FROM inventory_vendors WHERE owner_id = %s AND lower(name) = lower(%s)
+                           UNION ALL
+                           SELECT note FROM inventory_transactions WHERE owner_id = %s AND transaction_type IN ('PURCHASE', 'BILL')
+                               AND lower(note) = lower(%s)
+                       ) v LIMIT 1""",
+                    (owner_id, vendor_name, owner_id, vendor_name),
+                )
+                known = cur.fetchone()
+                if known:
+                    vendor_name = known[0]
+                cur.execute(
+                    """
+                    INSERT INTO inventory_transactions
+                        (owner_id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, amount_paid)
+                    VALUES (%s, NULL, %s, 0, '', %s, 'BILL', 'CREDIT', %s, %s, 0)
+                    RETURNING id, product_id, product_name, quantity, unit, amount, transaction_type, payment_method, transaction_date, note, created_at, amount_paid, cart_id
+                    """,
+                    (owner_id, description, amount, tx_date, vendor_name),
+                )
+                bill = serialize_transaction(cur.fetchone())
+                conn.commit()
+        return jsonify({"transaction": bill}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -736,7 +787,7 @@ def _update_party(side):
     renames them everywhere their history is stored so the ledger follows."""
     profiles = f"inventory_{side}s"
     payments = f"inventory_{side}_payments"
-    tx_filter = "transaction_type = 'PURCHASE'" if side == "vendor" else "transaction_type = 'SALE' AND payment_method = 'CREDIT'"
+    tx_filter = "transaction_type IN ('PURCHASE', 'BILL')" if side == "vendor" else "transaction_type = 'SALE' AND payment_method = 'CREDIT'"
 
     payload = request.get_json(silent=True) or {}
     owner_id = get_owner_id(payload)
@@ -835,7 +886,7 @@ def list_vendors():
                     """
                     SELECT note, COALESCE(SUM(amount), 0), COALESCE(SUM(amount_paid), 0), MAX(transaction_date), COUNT(*)
                     FROM inventory_transactions
-                    WHERE owner_id = %s AND transaction_type = 'PURCHASE' AND note IS NOT NULL AND note != ''
+                    WHERE owner_id = %s AND transaction_type IN ('PURCHASE', 'BILL') AND note IS NOT NULL AND note != ''
                     GROUP BY note
                     """,
                     (owner_id,),
@@ -953,7 +1004,7 @@ def delete_vendor():
                     """
                     SELECT COALESCE(SUM(amount), 0), COALESCE(SUM(amount_paid), 0)
                     FROM inventory_transactions
-                    WHERE owner_id = %s AND transaction_type = 'PURCHASE' AND lower(note) = lower(%s)
+                    WHERE owner_id = %s AND transaction_type IN ('PURCHASE', 'BILL') AND lower(note) = lower(%s)
                     """,
                     (owner_id, vendor_name),
                 )
@@ -1007,7 +1058,7 @@ def get_vendor_ledger():
                     """
                     SELECT id, product_name, quantity, unit, amount, amount_paid, transaction_date, created_at
                     FROM inventory_transactions
-                    WHERE owner_id = %s AND transaction_type = 'PURCHASE' AND lower(note) = lower(%s)
+                    WHERE owner_id = %s AND transaction_type IN ('PURCHASE', 'BILL') AND lower(note) = lower(%s)
                     ORDER BY transaction_date DESC, created_at DESC
                     """,
                     (owner_id, vendor_name),
@@ -1751,6 +1802,75 @@ def _period_bounds(period, anchor):
     return start, end
 
 
+ACTIVITY_KINDS = ("SALE", "PURCHASE", "WASTAGE", "PAYMENT_IN", "PAYMENT_OUT", "EXPENSE", "BILL")
+
+# Every money/stock movement of the business in one newest-first history:
+# product transactions, customer payments received, vendor payments made, expenses.
+ACTIVITY_SQL = """
+    SELECT * FROM (
+        SELECT 'T' || id AS uid, COALESCE(transaction_type, 'SALE') AS kind, product_name AS title, quantity, unit,
+               amount, amount_paid, payment_method, transaction_date AS day, created_at, COALESCE(note, '') AS note
+        FROM inventory_transactions WHERE owner_id = %(owner)s
+        UNION ALL
+        SELECT 'C' || id, 'PAYMENT_IN', customer_name, NULL, NULL, amount, amount, payment_method, payment_date, created_at, COALESCE(note, '')
+        FROM inventory_customer_payments WHERE owner_id = %(owner)s
+        UNION ALL
+        SELECT 'V' || id, 'PAYMENT_OUT', vendor_name, NULL, NULL, amount, amount, payment_method, payment_date, created_at, COALESCE(note, '')
+        FROM inventory_vendor_payments WHERE owner_id = %(owner)s
+        UNION ALL
+        SELECT 'E' || id, 'EXPENSE', category, NULL, NULL, amount, amount, payment_method, expense_date, created_at, COALESCE(note, '')
+        FROM inventory_expenses WHERE owner_id = %(owner)s
+    ) a
+"""
+
+
+@inventory_bp.get("/activity")
+def list_activity():
+    """Transaction log for the Home screen: newest first, paged, optional kind filter."""
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    try:
+        limit = min(max(int(request.args.get("limit", 30)), 1), 100)
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except ValueError:
+        return jsonify({"error": "limit and offset must be numbers"}), 400
+    kind = str(request.args.get("type", "ALL")).strip().upper()
+    where, params = "", {"owner": owner_id, "limit": limit + 1, "offset": offset}
+    if kind in ACTIVITY_KINDS:
+        where = "WHERE a.kind = %(kind)s"
+        params["kind"] = kind
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    ACTIVITY_SQL + where + " ORDER BY a.day DESC, a.created_at DESC, a.uid DESC LIMIT %(limit)s OFFSET %(offset)s",
+                    params,
+                )
+                rows = cur.fetchall()
+        cart_prefix = "__AUTOLEDGER_CART__:"
+        items = []
+        for uid, k, title, quantity, unit, amount, paid, method, day, created_at, note in rows[:limit]:
+            amount_f = float(amount or 0)
+            items.append({
+                "id": uid,
+                "type": k,
+                "title": title or "",
+                "quantity": float(quantity) if quantity is not None else None,
+                "unit": unit or "",
+                "amount": amount_f,
+                "amountDue": round(amount_f - float(paid or 0), 2) if k in ("SALE", "PURCHASE", "BILL") else 0,
+                "paymentMethod": method or "CASH",
+                "date": day.isoformat() if day else None,
+                "createdAt": created_at.isoformat() if created_at else None,
+                "note": "" if note.startswith(cart_prefix) else note,
+                "vendor": note if k in ("PURCHASE", "BILL") else "",
+            })
+        return jsonify({"items": items, "hasMore": len(rows) > limit, "offset": offset})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @inventory_bp.get("/transactions")
 def list_transactions():
     owner_id = get_owner_id()
@@ -1770,7 +1890,7 @@ def list_transactions():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                type_clause = ""
+                type_clause = "AND transaction_type <> 'BILL'"
                 params = [owner_id, start_date, end_date]
                 if type_filter != "ALL":
                     type_clause = "AND transaction_type = %s"
@@ -1799,7 +1919,7 @@ def list_transactions():
                         """
                         SELECT id, amount, amount_paid
                         FROM inventory_transactions
-                        WHERE owner_id = %s AND transaction_type = 'PURCHASE' AND lower(note) = %s
+                        WHERE owner_id = %s AND transaction_type IN ('PURCHASE', 'BILL') AND lower(note) = %s
                         ORDER BY transaction_date ASC, created_at ASC
                         """,
                         (owner_id, vendor_key),

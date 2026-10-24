@@ -43,6 +43,20 @@ def ensure_inventory_schema(cursor):
         ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20) NOT NULL DEFAULT 'CASH';
         ALTER TABLE inventory_transactions ADD COLUMN IF NOT EXISTS cart_id VARCHAR(100);
 
+        -- BILL: an amount owed to a vendor that is not a product purchase (transport, crates,
+        -- commission). Counts in the vendor's dues and ledger; never touches stock or sales.
+        DO $$
+        DECLARE r RECORD;
+        BEGIN
+            FOR r IN (SELECT conname FROM pg_constraint
+                      WHERE conrelid = 'inventory_transactions'::regclass AND contype = 'c'
+                        AND pg_get_constraintdef(oid) LIKE '%transaction_type%') LOOP
+                EXECUTE 'ALTER TABLE inventory_transactions DROP CONSTRAINT ' || quote_ident(r.conname);
+            END LOOP;
+        END $$;
+        ALTER TABLE inventory_transactions ADD CONSTRAINT inventory_transactions_type_check
+            CHECK (transaction_type IN ('SALE', 'WASTAGE', 'PURCHASE', 'BILL')) NOT VALID;
+
         -- amount_paid: how much was actually paid at the time of a PURCHASE (vs the
         -- total cost in `amount`). Lets a purchase be partly on credit to a vendor.
         -- Existing rows predate this feature, so backfill them as fully paid.

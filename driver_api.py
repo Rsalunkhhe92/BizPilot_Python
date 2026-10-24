@@ -121,6 +121,21 @@ def ensure_driver_schema(cursor):
         ALTER TABLE driver_trips ADD CONSTRAINT driver_trips_source_check CHECK (source IN ('MANUAL', 'QR', 'SMS', 'NOTIF'));
         CREATE UNIQUE INDEX IF NOT EXISTS uq_driver_trips_external_ref ON driver_trips(owner_id, external_ref) WHERE external_ref IS NOT NULL;
 
+        -- UPI reference (UTR / RRN) of a UPI trip. A driver can record a payment himself the moment
+        -- the passenger shows it; when Razorpay later reports the same RRN on his QR, that payment is
+        -- linked to this trip instead of creating a second one. One live trip per UTR per driver.
+        ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS upi_ref VARCHAR(40);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_driver_trips_upi_ref ON driver_trips(owner_id, upi_ref)
+            WHERE upi_ref IS NOT NULL AND NOT deleted;
+
+        -- Screenshot proof for a manually recorded payment (kept out of driver_trips so lists stay light).
+        CREATE TABLE IF NOT EXISTS driver_trip_receipts (
+            trip_id BIGINT PRIMARY KEY REFERENCES driver_trips(id) ON DELETE CASCADE,
+            owner_id BIGINT NOT NULL REFERENCES userdetails(id) ON DELETE CASCADE,
+            image TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
         CREATE TABLE IF NOT EXISTS driver_qr_payments (
             id BIGSERIAL PRIMARY KEY,
             owner_id BIGINT NOT NULL REFERENCES userdetails(id) ON DELETE CASCADE,
@@ -330,7 +345,8 @@ TRIP_COLUMNS = "id, route, fare, payment_mode, start_km, end_km, source, trip_ti
 # Trip list with, for a trip created from a merchant-QR payment, that payment's details.
 TRIP_LIST_SELECT = (
     "SELECT t.id, t.route, t.fare, t.payment_mode, t.start_km, t.end_km, t.source, t.trip_time, t.location_name, "
-    "t.latitude, t.longitude, p.gateway_payment_id, p.payer_vpa, p.rrn, p.transfer_status, p.refunded_amount "
+    "t.latitude, t.longitude, p.gateway_payment_id, p.payer_vpa, p.rrn, p.transfer_status, p.refunded_amount, "
+    "t.upi_ref, EXISTS (SELECT 1 FROM driver_trip_receipts r WHERE r.trip_id = t.id) "
     "FROM driver_trips t LEFT JOIN driver_merchant_payments p ON p.trip_id = t.id "
     "WHERE t.owner_id = %s AND NOT t.deleted "
 )
@@ -338,7 +354,9 @@ TRIP_LIST_SELECT = (
 
 def serialize_listed_trip(row):
     trip = serialize_trip(row[:11])
-    gateway_payment_id, payer_vpa, rrn, transfer_status, refunded_amount = row[11:]
+    gateway_payment_id, payer_vpa, rrn, transfer_status, refunded_amount, upi_ref, has_receipt = row[11:]
+    trip["upiRef"] = upi_ref or ""
+    trip["hasReceipt"] = bool(has_receipt)
     trip["payment"] = {
         "payerVpa": payer_vpa,
         "ref": rrn or gateway_payment_id,
@@ -698,6 +716,17 @@ def voice_log():
     })
 
 
+UPI_REF_RE = re.compile(r"^[A-Za-z0-9]{6,35}$")
+RECEIPT_MIME_TYPES = ("image/jpeg", "image/png")
+MAX_RECEIPT_BASE64_CHARS = 2_800_000  # ~2 MB image
+
+
+def _clean_upi_ref(value):
+    """UTR / RRN as typed or detected: spaces and dashes removed. None if absent or invalid."""
+    ref = re.sub(r"[\s-]", "", str(value or "")).upper()
+    return ref if UPI_REF_RE.match(ref) else None
+
+
 @driver_bp.post("/trips")
 def create_trip():
     payload = request.get_json(silent=True) or {}
@@ -727,24 +756,110 @@ def create_trip():
         longitude = float(payload.get("longitude"))
     except (TypeError, ValueError):
         longitude = None
+
+    # UPI reference: typed by the driver, or the one an SMS detection carries ("upi:<ref>").
+    upi_ref = None
+    if mode == "UPI":
+        raw_ref = payload.get("upiRef")
+        if raw_ref not in (None, ""):
+            upi_ref = _clean_upi_ref(raw_ref)
+            if not upi_ref:
+                return jsonify({"error": "Enter the UTR / reference number exactly as shown in the UPI app (6-35 letters or digits)."}), 400
+        elif external_ref and external_ref.startswith("upi:"):
+            upi_ref = _clean_upi_ref(external_ref[4:])
+
+    # Screenshot proof: shows this driver's payment details, so it needs his login token.
+    receipt = None
+    raw_receipt = str(payload.get("receiptBase64") or "")
+    if raw_receipt:
+        token_owner, denied = _token_owner(payload)
+        if denied:
+            return denied
+        owner_id = token_owner
+        mime = str(payload.get("receiptMime") or "image/jpeg")
+        if mime not in RECEIPT_MIME_TYPES:
+            return jsonify({"error": "The screenshot must be a JPG or PNG image."}), 400
+        if raw_receipt.startswith("data:"):
+            raw_receipt = raw_receipt.split(",", 1)[-1]
+        if len(raw_receipt) > MAX_RECEIPT_BASE64_CHARS:
+            return jsonify({"error": "The screenshot is too large (max 2 MB)."}), 413
+        try:
+            head = base64.b64decode(raw_receipt[:64], validate=True)
+        except (ValueError, TypeError):
+            return jsonify({"error": "The screenshot could not be read."}), 400
+        if not (head.startswith(b"\xff\xd8") or head.startswith(b"\x89PNG")):
+            return jsonify({"error": "The screenshot must be a JPG or PNG image."}), 400
+        receipt = f"data:{mime};base64,{raw_receipt}"
+
+    duplicate_reply = (jsonify({"duplicate": True}), 200) if external_ref else None
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                if upi_ref:
+                    # Already delivered by Razorpay on his QR (its RRN is the same UTR)?
+                    cur.execute(
+                        "SELECT trip_id FROM driver_merchant_payments WHERE owner_id = %s AND rrn = %s",
+                        (owner_id, upi_ref),
+                    )
+                    if cur.fetchone():
+                        return duplicate_reply or (jsonify({
+                            "error": "This payment was already received through your QR code - it is in today's list.",
+                            "duplicate": True,
+                        }), 409)
+                    cur.execute(
+                        "SELECT id FROM driver_trips WHERE owner_id = %s AND upi_ref = %s AND NOT deleted",
+                        (owner_id, upi_ref),
+                    )
+                    if cur.fetchone():
+                        return duplicate_reply or (jsonify({
+                            "error": "A payment with this UTR / reference number is already recorded.",
+                            "duplicate": True,
+                        }), 409)
                 cur.execute(
                     f"INSERT INTO driver_trips (owner_id, route, fare, payment_mode, start_km, end_km, source, "
-                    f"external_ref, trip_time, location_name, latitude, longitude) "
-                    f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()), %s, %s, %s) "
+                    f"external_ref, trip_time, location_name, latitude, longitude, upi_ref) "
+                    f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()), %s, %s, %s, %s) "
                     f"ON CONFLICT (owner_id, external_ref) WHERE external_ref IS NOT NULL DO NOTHING "
                     f"RETURNING {TRIP_COLUMNS}",
                     (owner_id, str(payload.get("route", "")).strip(), fare, mode,
                      payload.get("startKm"), payload.get("endKm"), source, external_ref, trip_time,
-                     str(payload.get("locationName", "")).strip(), latitude, longitude),
+                     str(payload.get("locationName", "")).strip(), latitude, longitude, upi_ref),
                 )
                 row = cur.fetchone()
+                if row and receipt:
+                    cur.execute(
+                        "INSERT INTO driver_trip_receipts (trip_id, owner_id, image) VALUES (%s, %s, %s)",
+                        (row[0], owner_id, receipt),
+                    )
                 conn.commit()
         if not row:
             return jsonify({"duplicate": True}), 200
-        return jsonify({"trip": serialize_trip(row)}), 201
+        trip = serialize_trip(row)
+        trip["upiRef"] = upi_ref or ""
+        trip["hasReceipt"] = bool(receipt)
+        return jsonify({"trip": trip}), 201
+    except psycopg.errors.UniqueViolation:
+        # Two saves of the same UTR at the same moment: the other one won.
+        return duplicate_reply or (jsonify({
+            "error": "A payment with this UTR / reference number is already recorded.", "duplicate": True,
+        }), 409)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@driver_bp.get("/trips/<int:trip_id>/receipt")
+def get_trip_receipt(trip_id):
+    owner_id, denied = _token_owner()
+    if denied:
+        return denied
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT image FROM driver_trip_receipts WHERE trip_id = %s AND owner_id = %s", (trip_id, owner_id))
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "No screenshot for this payment."}), 404
+        return jsonify({"image": row[0]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1009,7 +1124,7 @@ def cancel_qr_payment(qr_id):
 PAN_RE = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
 IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-MERCHANT_SYNC_MIN_SECONDS = 8
+MERCHANT_SYNC_MIN_SECONDS = 3  # matches the app polling every 3 s while the Trips screen is open
 MAX_TRANSFER_ATTEMPTS = 5
 _last_merchant_sync = {}
 # Why the latest sync for an owner could not read his payments (None when it worked).
@@ -1090,12 +1205,23 @@ def _route_enabled():
     return os.getenv("RAZORPAY_ROUTE_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 
 
+QR_NOT_ENABLED_TEXT = (
+    "QR Codes are not enabled on this Razorpay account. In the Razorpay Dashboard, activate "
+    "QR Codes (or ask Razorpay support to enable them for these keys), then submit again."
+)
+
+
 def _gateway_error_text(http_error):
     try:
         body = json.loads(http_error.read().decode("utf-8", errors="ignore"))
-        return str(body.get("error", {}).get("description") or "")
+        text = str(body.get("error", {}).get("description") or "")
     except (ValueError, AttributeError):
         return ""
+    # Razorpay answers a call to a product the account has not activated (e.g. QR Codes)
+    # with this generic routing message; say what it actually means.
+    if "requested URL was not found" in text and "/qr_codes" in (getattr(http_error, "url", "") or ""):
+        return QR_NOT_ENABLED_TEXT
+    return text
 
 
 def _platform_fee_percent():
@@ -1487,11 +1613,28 @@ def _record_merchant_payment(cur, owner_id, gateway_qr_id, payment, direct=False
     row = cur.fetchone()
     if not row:
         return None
+    if rrn:
+        # The driver already recorded this payment himself (same UTR): confirm that trip
+        # instead of adding a second one. Razorpay's amount is the true one.
+        cur.execute(
+            "UPDATE driver_trips t SET fare = %s, payment_mode = 'UPI', external_ref = %s, "
+            "route = CASE WHEN t.route = '' THEN %s ELSE t.route END "
+            "WHERE t.owner_id = %s AND t.upi_ref = %s AND NOT t.deleted "
+            "AND NOT EXISTS (SELECT 1 FROM driver_merchant_payments p WHERE p.trip_id = t.id) RETURNING t.id",
+            (amount, f"rzp:{payment_id}", f"UPI from {payer_vpa}" if payer_vpa else "QR payment", owner_id, rrn),
+        )
+        manual = cur.fetchone()
+        if manual:
+            cur.execute("UPDATE driver_merchant_payments SET trip_id = %s WHERE id = %s", (manual[0], row[0]))
+            return row[0]
     cur.execute(
-        "INSERT INTO driver_trips (owner_id, route, fare, payment_mode, source, external_ref, trip_time) "
-        "VALUES (%s, %s, %s, 'UPI', 'QR', %s, %s) "
+        "INSERT INTO driver_trips (owner_id, route, fare, payment_mode, source, external_ref, trip_time, upi_ref) "
+        "VALUES (%s, %s, %s, 'UPI', 'QR', %s, %s, "
+        # The UTR is kept only if no live trip holds it already (the unique index must never block a payment).
+        "(SELECT %s::varchar WHERE NOT EXISTS (SELECT 1 FROM driver_trips x WHERE x.owner_id = %s AND x.upi_ref = %s AND NOT x.deleted))) "
         "ON CONFLICT (owner_id, external_ref) WHERE external_ref IS NOT NULL DO NOTHING RETURNING id",
-        (owner_id, f"UPI from {payer_vpa}" if payer_vpa else "QR payment", amount, f"rzp:{payment_id}", paid_at),
+        (owner_id, f"UPI from {payer_vpa}" if payer_vpa else "QR payment", amount, f"rzp:{payment_id}", paid_at,
+         _clean_upi_ref(rrn), owner_id, _clean_upi_ref(rrn)),
     )
     trip = cur.fetchone()
     if trip:

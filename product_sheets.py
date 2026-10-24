@@ -24,6 +24,11 @@ DEFAULT_SHEETS = {
         ("Spinach", "bunch"), ("Methi", "bunch"), ("Coriander", "bunch"), ("Green Peas", "kg"),
         ("Beans", "kg"), ("Beetroot", "kg"), ("Lemon", "piece"), ("Drumstick", "piece"),
     ],
+    "Dairy": [
+        ("Milk", "litre"), ("Cow Milk", "litre"), ("Buffalo Milk", "litre"), ("Curd", "kg"), ("Buttermilk", "litre"),
+        ("Paneer", "kg"), ("Butter", "packet"), ("Cheese", "packet"), ("Fresh Cream", "packet"), ("Khoa", "kg"),
+        ("Lassi", "packet"), ("Shrikhand", "kg"), ("Flavoured Milk", "bottle"),
+    ],
     "Kirana": [
         ("Rice", "kg"), ("Wheat Atta", "kg"), ("Toor Dal", "kg"), ("Moong Dal", "kg"), ("Chana Dal", "kg"),
         ("Masoor Dal", "kg"), ("Sugar", "kg"), ("Salt", "packet"), ("Jaggery", "kg"), ("Tea Powder", "packet"),
@@ -59,7 +64,7 @@ DEFAULT_SHEETS = {
 
 # Which sheet to open first for each kind of business (matched against the business type name).
 BUSINESS_SHEET_HINTS = [
-    ("fruit", "Fruits"), ("vegetable", "Vegetables"), ("kirana", "Kirana"), ("retail", "Kirana"),
+    ("dairy", "Dairy"), ("milk", "Dairy"), ("fruit", "Fruits"), ("vegetable", "Vegetables"), ("kirana", "Kirana"), ("retail", "Kirana"),
     ("shoe", "Shoes"), ("footwear", "Shoes"), ("mobile", "Mobile"), ("medical", "Medical"), ("pharma", "Medical"),
 ]
 
@@ -71,6 +76,36 @@ MAX_UPLOAD_ROWS = 2000
 def name_key(name):
     """Same rule as the bulk save: case and extra spaces do not make a different product."""
     return " ".join(str(name or "").split()).lower()
+
+
+# Known product -> the sheet it belongs to (Milk -> Dairy), from the default lists above.
+HOME_SHEET = {}
+for _sheet, _items in DEFAULT_SHEETS.items():
+    for _name, _unit in _items:
+        HOME_SHEET.setdefault(" ".join(_name.split()).lower(), _sheet)
+
+
+def _category_key(value):
+    key = " ".join(str(value or "").split()).lower()
+    return key[:-1] if key.endswith("s") else key
+
+
+_PLACEHOLDER_CATEGORIES = {"", "general"} | {_category_key(n) for n in DEFAULT_SHEETS}
+
+
+def suggested_category(name, category):
+    """The category a product should be filed under. A known product (Milk, Apple, Rice...)
+    whose category is blank, 'General' or another built-in sheet's name (e.g. Milk saved as
+    'Fruit') goes to its own sheet (Dairy). Any category the owner named himself is kept."""
+    category = " ".join(str(category or "").split())
+    home = HOME_SHEET.get(" ".join(str(name or "").split()).lower())
+    if not home:
+        # 'Fruit' / 'fruits' -> the built-in 'Fruits' sheet, so one kind never gets two tabs.
+        canonical = next((n for n in DEFAULT_SHEETS if _category_key(n) == _category_key(category)), None)
+        return canonical or category or "General"
+    if _category_key(category) in _PLACEHOLDER_CATEGORIES:
+        return home  # blank / General / a built-in sheet name, incl. 'Fruit' for 'Fruits'
+    return category
 
 
 def _number(value):
@@ -93,7 +128,7 @@ def build_sheets(business_type, products):
     owned = set()
     own_order = []
     for product in products:
-        category = (product.get("category") or "General").strip() or "General"
+        category = suggested_category(product["name"], product.get("category"))
         rows = sheet(category)
         if category.lower() not in [c.lower() for c in own_order]:
             own_order.append(category)
