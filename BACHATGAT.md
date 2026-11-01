@@ -95,3 +95,15 @@ requires them where SHG practice does:
 
 Separate logins for members, treasurers, field officers or auditors are not part of
 this module (the platform has no per-person accounts inside a customer).
+
+## Autopilot (AI agent) - `bachatgat_agent.py`
+
+Runs each active group by itself (background thread every `SHG_AUTOPILOT_INTERVAL_MIN`, a group at most every
+`SHG_AUTOPILOT_EVERY_HOURS` = 6; also `POST /api/bachatgat/agent/cron` with header `X-Cron-Secret: $SHG_AGENT_CRON_SECRET`
+for an external cron, since a sleeping free Render instance runs no thread). Steps: approve pending members with ID
+recorded, raise dues, sync Razorpay, penalties/overdue, loans (submit -> review -> approve within the Autopilot limit or
+a passed resolution -> disburse when cash/bank allows, authorized by Treasurer/President), SMS payment links for overdue
+savings and installments (loan links post as repayments), schedule next meeting, reminders, close last month from the 7th.
+`POST /agent/scan` reads a meeting-register photo with Gemini and posts attendance, savings, repayments, loan requests and
+new members. Every action is in `shg_agent_actions`; money actions undo by reversal; undone records are left to people.
+Disabling: per group in the app, or `SHG_AUTOPILOT=off` for the thread. Tests: `test_bachatgat_agent.py`.

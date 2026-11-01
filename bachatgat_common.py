@@ -140,6 +140,9 @@ def require_shg_tenant():
     # Razorpay's webhook has no login; it is authenticated by the group's webhook secret instead.
     if request.path.startswith("/api/bachatgat/gateway-webhook/"):
         return None
+    # The Autopilot's cron trigger is authenticated by SHG_AGENT_CRON_SECRET instead.
+    if request.path == "/api/bachatgat/agent/cron":
+        return None
     header = request.headers.get("Authorization", "")
     user_id = verify_token(header[7:].strip()) if header.startswith("Bearer ") else None
     if user_id is None:

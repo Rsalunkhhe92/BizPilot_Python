@@ -19,6 +19,8 @@ from driver_api import driver_bp, ensure_driver_schema
 from travel_api import travel_bp, ensure_travel_schema
 from bachatgat_api import bachatgat_bp
 from bachatgat_service import BACHAT_GAT_FEATURES, ensure_bachatgat_schema
+from foodseller_api import foodseller_bp
+from foodseller_service import FOOD_SELLER_FEATURES, ensure_foodseller_schema
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -31,6 +33,7 @@ app.register_blueprint(building_bp)
 app.register_blueprint(driver_bp)
 app.register_blueprint(travel_bp)
 app.register_blueprint(bachatgat_bp)
+app.register_blueprint(foodseller_bp)
 WEB_DIRECTORY = os.path.join(os.path.dirname(__file__), "web")
 VALID_USER_TYPES = {"admin", "customer"}
 VALID_PLAN_TYPES = {"monthly", "quarterly", "yearly"}
@@ -75,6 +78,8 @@ DEFAULT_BUSINESS_FEATURES = {
     "Travels Online Booking": ["online_booking", "vehicle", "trips", "fuel"],
     "Travels": ["online_booking", "vehicle", "trips", "fuel"],
     "Mahila Bachat Gat": BACHAT_GAT_FEATURES,
+    "Food Seller": FOOD_SELLER_FEATURES,
+    "Food sellers": FOOD_SELLER_FEATURES,
     "Other local businesses": ["ledger", "dues"],
 }
 
@@ -281,6 +286,25 @@ def ensure_bachatgat_tables():
 
 
 ensure_bachatgat_tables()
+
+
+def ensure_foodseller_tables():
+    """Food Seller schema in its own transaction, for the same reason as Bachat Gat above."""
+    try:
+        with psycopg.connect(get_database_url()) as connection:
+            with connection.cursor() as cursor:
+                ensure_foodseller_schema(cursor)
+            connection.commit()
+    except Exception as e:
+        print(f"Food Seller schema notice: {e}")
+
+
+ensure_foodseller_tables()
+
+# Mahila Bachat Gat Autopilot: background runs (SHG_AUTOPILOT=off disables).
+from bachatgat_agent import start_autopilot  # noqa: E402
+
+start_autopilot(app)
 
 
 def create_admin_notification(cursor, category, notification_type, title, message, customer_id=None, customer_name=None, action_url=None):

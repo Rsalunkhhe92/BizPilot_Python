@@ -476,18 +476,27 @@ def disburse_loan(cur, loan_id):
         raise ApiError(409, "Borrower is no longer an active member")
     method = choice(payload, "paymentMethod", PAYMENT_METHODS, default="Cash")
     on = parse_date(payload, "disbursedOn", default=date.today())
+    first_due = parse_date(payload, "firstDueDate", default=add_period(on, loan["frequency"], 1))
+    txn, rows = disburse(cur, group, policy, loan, auth_id, method, on, first_due, payload.get("bankAccountId"),
+                         text(payload, "referenceNumber", 80))
+    return {"loan": _loan_out(cur, loan_id), "transaction": fetch_txn(cur, txn["id"]), "schedule": rows}, 201
+
+
+def disburse(cur, group, policy, loan, auth_id, method, on, first_due, bank_account_id=None, reference=None, by=None):
+    """Posts an Approved loan's disbursement, writes its schedule and makes it Active.
+    The caller has checked the authorizing office-bearer. Returns (transaction, schedule rows)."""
+    loan_id = loan["id"]
     if on < loan["application_date"]:
         raise ApiError(422, "Disbursement date is before the application date")
-    first_due = parse_date(payload, "firstDueDate", default=add_period(on, loan["frequency"], 1))
     if first_due <= on:
         raise ApiError(422, "First installment must fall after the disbursement date")
     amount = money(loan["approved_amount"])
     rows = build_schedule(amount, loan["interest_rate"], loan["installments"], loan["interest_method"],
                           loan["frequency"], first_due, policy["round_to_rupee"])
-    txn = post_transaction(cur, group, "LOAN_DISBURSEMENT", amount, on, method, payload.get("bankAccountId"),
+    txn = post_transaction(cur, group, "LOAN_DISBURSEMENT", amount, on, method, bank_account_id,
                            member_id=loan["member_id"], loan_id=loan_id, resolution_id=loan["resolution_id"],
                            narration=f"Disbursement of loan {loan['application_number']}",
-                           reference_number=text(payload, "referenceNumber", 80), receipt_prefix="LDS")
+                           reference_number=reference, receipt_prefix="LDS")
     # A reversed earlier disbursement leaves its (superseded) schedule behind; start a new version.
     schedule_version = loan["schedule_version"] + 1
     for r in rows:
@@ -502,10 +511,10 @@ def disburse_loan(cur, loan_id):
         (on, first_due, schedule_version, auth_id, loan_id),
     )
     record_event(cur, group["id"], "LOAN", loan_id, "DISBURSED", "Approved", "Active",
-                 {"amount": amount, "txnId": txn["id"], "authorizedBy": auth_id})
+                 {"amount": amount, "txnId": txn["id"], "authorizedBy": auth_id, "by": by})
     notify(cur, group["id"], "LOAN_STATUS", "Loan disbursed",
            f"Loan {loan['application_number']} was disbursed.", f"loan-{loan_id}-disbursed", "LOAN", loan_id)
-    return {"loan": _loan_out(cur, loan_id), "transaction": fetch_txn(cur, txn["id"]), "schedule": rows}, 201
+    return txn, rows
 
 
 @bachatgat_bp.get("/loans/<int:loan_id>")

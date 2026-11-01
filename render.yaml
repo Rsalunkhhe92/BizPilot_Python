@@ -18,5 +18,7 @@ services:
           property: connectionString
       - key: GEMINI_API_KEY
         sync: false
+      - key: SHG_AGENT_CRON_SECRET
+        generateValue: true
       - key: FLASK_DEBUG
         value: "0"

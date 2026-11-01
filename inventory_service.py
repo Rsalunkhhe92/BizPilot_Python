@@ -161,6 +161,66 @@ def ensure_inventory_schema(cursor):
             UNIQUE (product_id, price_date)
         );
 
+        -- product_type: 'SELL' or 'PURCHASE', chosen by the owner; NULL reads as SELL.
+        ALTER TABLE inventory_products ADD COLUMN IF NOT EXISTS product_type VARCHAR(10);
+
+        -- Recipe deduction takes small amounts (25 gram = 0.025 kg), which 2 decimals would round away.
+        DO $$
+        BEGIN
+            IF (SELECT numeric_scale FROM information_schema.columns
+                WHERE table_name = 'inventory_products' AND column_name = 'stock_qty') < 4 THEN
+                ALTER TABLE inventory_products ALTER COLUMN stock_qty TYPE NUMERIC(14, 4);
+            END IF;
+        END $$;
+
+        -- 9. Recipes: what one batch of a selling product uses. Selling it takes the ingredients
+        -- from stock instead of the product's own stock_qty.
+        CREATE TABLE IF NOT EXISTS inventory_recipes (
+            id BIGSERIAL PRIMARY KEY,
+            owner_id BIGINT NOT NULL REFERENCES userdetails(id) ON DELETE CASCADE,
+            product_id BIGINT NOT NULL UNIQUE REFERENCES inventory_products(id) ON DELETE CASCADE,
+            yield_qty NUMERIC(14, 4) NOT NULL DEFAULT 1 CHECK (yield_qty > 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS inventory_recipe_ingredients (
+            id BIGSERIAL PRIMARY KEY,
+            recipe_id BIGINT NOT NULL REFERENCES inventory_recipes(id) ON DELETE CASCADE,
+            ingredient_product_id BIGINT NOT NULL REFERENCES inventory_products(id),
+            quantity NUMERIC(14, 4) NOT NULL CHECK (quantity > 0),
+            unit VARCHAR(30) NOT NULL,
+            UNIQUE (recipe_id, ingredient_product_id)
+        );
+        -- 10. What each recipe sale took, frozen at sale time, so editing or deleting that sale gives
+        -- back exactly what left stock even if the recipe has changed since.
+        CREATE TABLE IF NOT EXISTS inventory_sale_usage (
+            id BIGSERIAL PRIMARY KEY,
+            owner_id BIGINT NOT NULL REFERENCES userdetails(id) ON DELETE CASCADE,
+            transaction_id BIGINT NOT NULL REFERENCES inventory_transactions(id) ON DELETE CASCADE,
+            ingredient_product_id BIGINT NOT NULL REFERENCES inventory_products(id),
+            required_qty NUMERIC(14, 4) NOT NULL,
+            deducted_qty NUMERIC(14, 4) NOT NULL,
+            unit_cost NUMERIC(14, 4) NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        -- 11. Stock the owner used by hand ("20 kg potato today"). For one product on one day, this
+        -- and recipe sales are two views of the same usage: only the larger leaves stock.
+        CREATE TABLE IF NOT EXISTS inventory_usage_log (
+            id BIGSERIAL PRIMARY KEY,
+            owner_id BIGINT NOT NULL REFERENCES userdetails(id) ON DELETE CASCADE,
+            product_id BIGINT NOT NULL REFERENCES inventory_products(id),
+            quantity NUMERIC(14, 4) NOT NULL CHECK (quantity > 0),
+            deducted_qty NUMERIC(14, 4) NOT NULL DEFAULT 0,
+            unit_cost NUMERIC(14, 4) NOT NULL DEFAULT 0,
+            usage_date DATE NOT NULL DEFAULT CURRENT_DATE,
+            note TEXT DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_inventory_usage_log ON inventory_usage_log(owner_id, product_id, usage_date);
+        CREATE INDEX IF NOT EXISTS idx_inventory_sale_usage_tx ON inventory_sale_usage(transaction_id);
+        CREATE INDEX IF NOT EXISTS idx_inventory_sale_usage_owner ON inventory_sale_usage(owner_id, ingredient_product_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_inventory_recipe_ingredient ON inventory_recipe_ingredients(ingredient_product_id);
+
         CREATE INDEX IF NOT EXISTS idx_inventory_products_owner ON inventory_products(owner_id);
         CREATE INDEX IF NOT EXISTS idx_inventory_tx_owner_date ON inventory_transactions(owner_id, transaction_date);
         CREATE INDEX IF NOT EXISTS idx_inventory_tx_product ON inventory_transactions(product_id);
@@ -178,4 +238,13 @@ def ensure_inventory_schema(cursor):
         UPDATE inventory_transactions
         SET amount_paid = amount
         WHERE amount_paid = 0 AND amount > 0 AND created_at < '2026-10-05'::timestamptz
+    """)
+    # One-time sort of products that predate Sell / Purchase: a cost with no selling price means
+    # bought, not sold. Fixed cutoff, because a NEW product is normally bought before its rate is
+    # set and must stay a selling product.
+    cursor.execute("""
+        UPDATE inventory_products
+        SET product_type = 'PURCHASE'
+        WHERE product_type IS NULL AND selling_price <= 0 AND cost_price > 0
+          AND created_at < '2026-11-03'::timestamptz
     """)

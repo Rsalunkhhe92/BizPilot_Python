@@ -153,9 +153,18 @@ def apply_followup_payments(dues, payments):
     return dues
 
 
+PRODUCT_TYPES = ("SELL", "PURCHASE")
+
+
+def product_type_of(product_type):
+    """The owner's choice. Unclassified reads as SELL: a new product is usually bought before
+    its rate is set, and must not drop out of the selling flow meanwhile."""
+    return product_type if product_type in PRODUCT_TYPES else "SELL"
+
+
 def serialize_product(row):
     (pid, name, category, unit, stock_qty, selling_price, cost_price,
-     low_stock_threshold, status, created_at, updated_at) = row
+     low_stock_threshold, status, created_at, updated_at, product_type) = row
     return {
         "id": str(pid),
         "name": name,
@@ -166,6 +175,7 @@ def serialize_product(row):
         "costPrice": float(cost_price or 0),
         "lowStockThreshold": float(low_stock_threshold or 0),
         "status": status,
+        "productType": product_type_of(product_type),
     }
 
 
@@ -197,6 +207,418 @@ def serialize_transaction(row):
     }
 
 
+# ---------------------------------------------------------------------------
+# Recipes: selling a prepared product takes its ingredients from stock.
+# ---------------------------------------------------------------------------
+UNIT_SIZES = {
+    "kg": ("mass", 1000), "kgs": ("mass", 1000), "kilo": ("mass", 1000), "kilogram": ("mass", 1000),
+    "g": ("mass", 1), "gm": ("mass", 1), "gram": ("mass", 1), "grams": ("mass", 1),
+    "litre": ("volume", 1000), "liter": ("volume", 1000), "ltr": ("volume", 1000), "l": ("volume", 1000),
+    "ml": ("volume", 1),
+    "piece": ("count", 1), "pieces": ("count", 1), "pcs": ("count", 1), "pc": ("count", 1), "dozen": ("count", 12),
+}
+
+
+def convert_unit(quantity, from_unit, to_unit):
+    """Quantity in to_unit, or None when the two units cannot convert (kg to litre)."""
+    source, target = str(from_unit or "").strip().lower(), str(to_unit or "").strip().lower()
+    if source == target:
+        return quantity
+    a, b = UNIT_SIZES.get(source), UNIT_SIZES.get(target)
+    if not a or not b or a[0] != b[0]:
+        return None
+    return quantity * a[1] / b[1]
+
+
+class RecipeShortage(Exception):
+    def __init__(self, shortages):
+        super().__init__("Not enough stock")
+        self.shortages = shortages
+
+
+def _shortage_response(err):
+    names = ", ".join(f"{s['name']} (short by {s['shortBy']:g} {s['unit']})" for s in err.shortages)
+    return jsonify({"error": f"Not enough stock: {names}", "code": "INSUFFICIENT_STOCK", "shortages": err.shortages}), 409
+
+
+def _load_recipes(cur, owner_id, product_ids=None):
+    """{product id: recipe}, with each ingredient's quantity per one unit sold, in its stock unit."""
+    sql = """
+        SELECT r.product_id, r.yield_qty, i.ingredient_product_id, i.quantity, i.unit,
+               p.name, p.unit, p.stock_qty, p.cost_price
+        FROM inventory_recipes r
+        JOIN inventory_recipe_ingredients i ON i.recipe_id = r.id
+        JOIN inventory_products p ON p.id = i.ingredient_product_id
+        WHERE r.owner_id = %s
+    """
+    params = [owner_id]
+    if product_ids is not None:
+        sql += " AND r.product_id = ANY(%s)"
+        params.append(list(product_ids))
+    cur.execute(sql + " ORDER BY i.id", params)
+    recipes = {}
+    for product_id, yield_qty, ingredient_id, quantity, unit, name, stock_unit, stock_qty, cost_price in cur.fetchall():
+        # Units were checked when the recipe was saved, but the stock unit can be edited later.
+        converted = convert_unit(quantity, unit, stock_unit)
+        recipe = recipes.setdefault(product_id, {"yieldQty": yield_qty, "ingredients": []})
+        recipe["ingredients"].append({
+            "productId": ingredient_id, "name": name, "quantity": quantity, "unit": unit, "stockUnit": stock_unit,
+            "stockQty": stock_qty or Decimal("0"), "costPrice": cost_price or Decimal("0"),
+            "perUnit": (converted if converted is not None else quantity) / yield_qty,
+        })
+    return recipes
+
+
+def _apply_recipes(cur, owner_id, products):
+    """A recipe product has no stock of its own: its stock is what the ingredients can make,
+    so low-stock, cart limits and availability work unchanged. Its cost is what they cost."""
+    recipes = _load_recipes(cur, owner_id)
+    used_today = _used_today(cur, owner_id)
+    for product in products:
+        recipe = recipes.get(int(product["id"]))
+        product["hasRecipe"] = bool(recipe)
+        product["usedToday"] = float(used_today.get(int(product["id"]), 0))
+        if recipe:
+            ingredients = recipe["ingredients"]
+            can_make = min(int(i["stockQty"] // i["perUnit"]) for i in ingredients)
+            product["stockQty"] = float(max(can_make, 0))
+            product["ingredientCount"] = len(ingredients)
+            product["costPrice"] = round(float(sum(i["perUnit"] * i["costPrice"] for i in ingredients)), 2)
+    return products
+
+
+def _used_today(cur, owner_id):
+    """{product id: quantity used today}, counting by-hand and recipe usage of a product once."""
+    cur.execute(
+        """SELECT product_id, SUM(quantity) FROM inventory_usage_log
+           WHERE owner_id = %s AND usage_date = CURRENT_DATE GROUP BY product_id""",
+        (owner_id,),
+    )
+    used = dict(cur.fetchall())
+    cur.execute(
+        """SELECT u.ingredient_product_id, SUM(u.required_qty) FROM inventory_sale_usage u
+           JOIN inventory_transactions t ON t.id = u.transaction_id
+           WHERE u.owner_id = %s AND t.transaction_date = CURRENT_DATE GROUP BY u.ingredient_product_id""",
+        (owner_id,),
+    )
+    for product_id, required in cur.fetchall():
+        used[product_id] = max(used.get(product_id, Decimal("0")), required)
+    return used
+
+
+def _usage_gap(cur, owner_id, product_id, day):
+    """How much more must leave stock for this product and day. By-hand use and recipe sales are
+    two views of the same usage, so the target is the larger of them, whichever came first."""
+    cur.execute(
+        """SELECT COALESCE(SUM(quantity), 0), COALESCE(SUM(deducted_qty), 0) FROM inventory_usage_log
+           WHERE owner_id = %s AND product_id = %s AND usage_date = %s""",
+        (owner_id, product_id, day),
+    )
+    manual, manual_taken = cur.fetchone()
+    cur.execute(
+        """SELECT COALESCE(SUM(u.required_qty), 0), COALESCE(SUM(u.deducted_qty), 0) FROM inventory_sale_usage u
+           JOIN inventory_transactions t ON t.id = u.transaction_id
+           WHERE u.owner_id = %s AND u.ingredient_product_id = %s AND t.transaction_date = %s""",
+        (owner_id, product_id, day),
+    )
+    recipe, recipe_taken = cur.fetchone()
+    return max(max(manual, recipe) - manual_taken - recipe_taken, Decimal("0"))
+
+
+def _refill_usage(cur, owner_id, product_ids, day):
+    """After an entry is removed, what is left on that day may still need more than was taken: a
+    sale that manual use had covered, say. Takes that, as far as stock allows, on the latest entry."""
+    if not product_ids:
+        return
+    cur.execute(
+        "SELECT id, stock_qty FROM inventory_products WHERE id = ANY(%s) AND owner_id = %s ORDER BY id FOR UPDATE",
+        (list(product_ids), owner_id),
+    )
+    for product_id, stock_qty in cur.fetchall():
+        take = min(_usage_gap(cur, owner_id, product_id, day), stock_qty or Decimal("0"))
+        if take <= 0:
+            continue
+        cur.execute("UPDATE inventory_products SET stock_qty = stock_qty - %s, updated_at = NOW() WHERE id = %s", (take, product_id))
+        cur.execute(
+            """UPDATE inventory_usage_log SET deducted_qty = deducted_qty + %s WHERE id = (
+                   SELECT id FROM inventory_usage_log WHERE owner_id = %s AND product_id = %s AND usage_date = %s ORDER BY id DESC LIMIT 1)
+               RETURNING id""",
+            (take, owner_id, product_id, day),
+        )
+        if not cur.fetchone():
+            cur.execute(
+                """UPDATE inventory_sale_usage SET deducted_qty = deducted_qty + %s WHERE id = (
+                       SELECT u.id FROM inventory_sale_usage u JOIN inventory_transactions t ON t.id = u.transaction_id
+                       WHERE u.owner_id = %s AND u.ingredient_product_id = %s AND t.transaction_date = %s ORDER BY u.id DESC LIMIT 1)""",
+                (take, owner_id, product_id, day),
+            )
+
+
+def _take_usage(cur, owner_id, transaction_id, usage, allow_shortage, day):
+    """usage: (ingredient id, required qty[, unit cost]). Takes what is not already out of stock for
+    that day, or raises RecipeShortage, which rolls back the sale. With allow_shortage, stock stops at
+    zero as other product entries do, and deducted_qty records what really left. Returns the total cost."""
+    cur.execute(
+        "SELECT id, name, unit, stock_qty, cost_price FROM inventory_products WHERE id = ANY(%s) AND owner_id = %s ORDER BY id FOR UPDATE",
+        ([u[0] for u in usage], owner_id),
+    )
+    stock = {r[0]: r for r in cur.fetchall()}
+    shortages, total_cost = [], Decimal("0")
+    for entry in usage:
+        ingredient_id, required = entry[0], Decimal(entry[1]).quantize(Decimal("0.0001"))
+        _, name, unit, stock_qty, cost_price = stock[ingredient_id]
+        stock_qty = stock_qty or Decimal("0")
+        unit_cost = entry[2] if len(entry) > 2 else (cost_price or Decimal("0"))
+        total_cost += required * unit_cost
+        cur.execute(
+            """INSERT INTO inventory_sale_usage (owner_id, transaction_id, ingredient_product_id, required_qty, deducted_qty, unit_cost)
+               VALUES (%s, %s, %s, %s, 0, %s) RETURNING id""",
+            (owner_id, transaction_id, ingredient_id, required, unit_cost),
+        )
+        row_id = cur.fetchone()[0]
+        gap = _usage_gap(cur, owner_id, ingredient_id, day)
+        if gap > stock_qty:
+            shortages.append({"productId": str(ingredient_id), "name": name, "unit": unit, "shortBy": float(gap - stock_qty)})
+        take = min(gap, stock_qty)
+        cur.execute("UPDATE inventory_products SET stock_qty = stock_qty - %s, updated_at = NOW() WHERE id = %s", (take, ingredient_id))
+        cur.execute("UPDATE inventory_sale_usage SET deducted_qty = %s WHERE id = %s", (take, row_id))
+    if shortages and not allow_shortage:
+        raise RecipeShortage(shortages)
+    return total_cost
+
+
+def _give_back_usage(cur, owner_id, transaction_id, day):
+    """Returns to stock what a recipe sale took and removes its usage rows, then settles that day
+    again in case by-hand use still needs some of it. Empty for any other entry."""
+    cur.execute(
+        """SELECT id, ingredient_product_id, required_qty, deducted_qty, unit_cost FROM inventory_sale_usage
+           WHERE transaction_id = %s AND owner_id = %s ORDER BY ingredient_product_id""",
+        (transaction_id, owner_id),
+    )
+    rows = cur.fetchall()
+    for _, ingredient_id, _, deducted, _ in rows:
+        cur.execute("UPDATE inventory_products SET stock_qty = stock_qty + %s, updated_at = NOW() WHERE id = %s", (deducted, ingredient_id))
+    if rows:
+        cur.execute("DELETE FROM inventory_sale_usage WHERE transaction_id = %s AND owner_id = %s", (transaction_id, owner_id))
+        _refill_usage(cur, owner_id, [r[1] for r in rows], day)
+    return [{"productId": r[1], "required": r[2], "unitCost": r[4]} for r in rows]
+
+
+def _stock_of(cur, product_id):
+    cur.execute("SELECT stock_qty FROM inventory_products WHERE id = %s", (product_id,))
+    return float(cur.fetchone()[0] or 0)
+
+
+@inventory_bp.post("/usage")
+def record_usage():
+    """Stock the owner used by hand. Refused beyond what is in stock; usage the day's recipe
+    sales already took is not deducted again."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    try:
+        product_id = int(payload.get("productId"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "productId is required"}), 400
+    entered = to_decimal(payload.get("quantity"))
+    if not (entered.is_finite() and entered > 0):
+        return jsonify({"error": "Enter the quantity used"}), 400
+    day = parse_date(payload.get("date"))
+    note = str(payload.get("note", "")).strip()[:200]
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT name, unit, stock_qty, cost_price FROM inventory_products WHERE id = %s AND owner_id = %s AND status = 'active' FOR UPDATE",
+                    (product_id, owner_id),
+                )
+                product = cur.fetchone()
+                if not product:
+                    return jsonify({"error": "Product not found"}), 404
+                name, stock_unit, stock_qty, cost_price = product
+                cur.execute("SELECT 1 FROM inventory_recipes WHERE product_id = %s AND owner_id = %s", (product_id, owner_id))
+                if cur.fetchone():
+                    return jsonify({"error": f"{name} is made from its recipe. Record use of its ingredients instead."}), 409
+                unit = str(payload.get("unit") or stock_unit).strip()
+                quantity = convert_unit(entered, unit, stock_unit)
+                if quantity is None:
+                    return jsonify({"error": f"{name} is counted in {stock_unit}, which {unit} cannot convert to"}), 400
+                quantity = quantity.quantize(Decimal("0.0001"))
+                if quantity <= 0:
+                    return jsonify({"error": "Enter the quantity used"}), 400
+                cur.execute(
+                    """INSERT INTO inventory_usage_log (owner_id, product_id, quantity, unit_cost, usage_date, note)
+                       VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                    (owner_id, product_id, quantity, cost_price or Decimal("0"), day, note),
+                )
+                entry_id = cur.fetchone()[0]
+                gap = _usage_gap(cur, owner_id, product_id, day)
+                if gap > (stock_qty or Decimal("0")):
+                    conn.rollback()
+                    return jsonify({"error": f"Only {float(stock_qty or 0):g} {stock_unit} of {name} is in stock"}), 409
+                cur.execute("UPDATE inventory_products SET stock_qty = stock_qty - %s, updated_at = NOW() WHERE id = %s", (gap, product_id))
+                cur.execute("UPDATE inventory_usage_log SET deducted_qty = %s WHERE id = %s", (gap, entry_id))
+                remaining = _stock_of(cur, product_id)
+                conn.commit()
+        return jsonify({"id": str(entry_id), "quantity": float(quantity), "deducted": float(gap), "stockQty": remaining}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.get("/usage")
+def list_usage():
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    try:
+        product_id = int(request.args.get("product_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "product_id is required"}), 400
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, quantity, deducted_qty, usage_date, note FROM inventory_usage_log
+                       WHERE owner_id = %s AND product_id = %s ORDER BY usage_date DESC, id DESC LIMIT 50""",
+                    (owner_id, product_id),
+                )
+                entries = [{"id": str(r[0]), "quantity": float(r[1]), "deducted": float(r[2]), "date": r[3].isoformat(), "note": r[4] or ""} for r in cur.fetchall()]
+        return jsonify({"entries": entries})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.delete("/usage/<int:entry_id>")
+def delete_usage(entry_id):
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT product_id FROM inventory_usage_log WHERE id = %s AND owner_id = %s", (entry_id, owner_id))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"error": "Entry not found"}), 404
+                product_id = row[0]
+                cur.execute("SELECT 1 FROM inventory_products WHERE id = %s FOR UPDATE", (product_id,))
+                cur.execute(
+                    "DELETE FROM inventory_usage_log WHERE id = %s AND owner_id = %s RETURNING deducted_qty, usage_date",
+                    (entry_id, owner_id),
+                )
+                deducted, day = cur.fetchone()
+                cur.execute("UPDATE inventory_products SET stock_qty = stock_qty + %s, updated_at = NOW() WHERE id = %s", (deducted, product_id))
+                _refill_usage(cur, owner_id, [product_id], day)
+                remaining = _stock_of(cur, product_id)
+                conn.commit()
+        return jsonify({"deleted": True, "stockQty": remaining})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.get("/products/<int:product_id>/recipe")
+def get_recipe(product_id):
+    owner_id = get_owner_id()
+    if not owner_id:
+        return jsonify({"error": "owner_id is required"}), 400
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                recipe = _load_recipes(cur, owner_id, [product_id]).get(product_id)
+        if not recipe:
+            return jsonify({"recipe": None})
+        return jsonify({"recipe": {
+            "yieldQty": float(recipe["yieldQty"]),
+            "ingredients": [{"productId": str(i["productId"]), "name": i["name"], "quantity": float(i["quantity"]), "unit": i["unit"], "stockUnit": i["stockUnit"]}
+                            for i in recipe["ingredients"]],
+        }})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@inventory_bp.put("/products/<int:product_id>/recipe")
+def save_recipe(product_id):
+    """Replaces the recipe; no ingredients removes it. Past sales keep the usage they froze."""
+    payload = request.get_json(silent=True) or {}
+    owner_id = get_owner_id(payload)
+    if not owner_id:
+        return jsonify({"error": "ownerId is required"}), 400
+    lines = payload.get("ingredients") or []
+    yield_qty = to_decimal(payload.get("yieldQty"), "1")
+    if not isinstance(lines, list) or len(lines) > 100:
+        return jsonify({"error": "Ingredients must be a list"}), 400
+    if lines and not (yield_qty.is_finite() and yield_qty > 0):
+        return jsonify({"error": "Enter how many this recipe makes"}), 400
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT product_type FROM inventory_products WHERE id = %s AND owner_id = %s AND status = 'active' FOR UPDATE",
+                    (product_id, owner_id),
+                )
+                product = cur.fetchone()
+                if not product:
+                    return jsonify({"error": "Product not found"}), 404
+                if lines and product[0] == "PURCHASE":
+                    return jsonify({"error": "A purchase product cannot have a recipe. Change its type to sell it first."}), 409
+                cur.execute(
+                    """SELECT p.name FROM inventory_recipe_ingredients i JOIN inventory_recipes r ON r.id = i.recipe_id
+                       JOIN inventory_products p ON p.id = r.product_id
+                       WHERE i.ingredient_product_id = %s AND r.owner_id = %s AND p.status = 'active' LIMIT 1""",
+                    (product_id, owner_id),
+                )
+                parent = cur.fetchone()
+                if lines and parent:
+                    return jsonify({"error": f"This product is an ingredient of {parent[0]}, so it cannot have its own recipe."}), 409
+
+                prepared, seen = [], set()
+                for line in lines:
+                    try:
+                        ingredient_id = int((line or {}).get("productId"))
+                    except (TypeError, ValueError):
+                        return jsonify({"error": "Choose a product for every ingredient"}), 400
+                    quantity = to_decimal(line.get("quantity"))
+                    if ingredient_id == product_id:
+                        return jsonify({"error": "A product cannot be its own ingredient"}), 400
+                    if ingredient_id in seen:
+                        return jsonify({"error": "An ingredient is listed twice in this recipe"}), 400
+                    seen.add(ingredient_id)
+                    cur.execute(
+                        "SELECT name, unit FROM inventory_products WHERE id = %s AND owner_id = %s AND status = 'active'",
+                        (ingredient_id, owner_id),
+                    )
+                    ingredient = cur.fetchone()
+                    if not ingredient:
+                        return jsonify({"error": "An ingredient was not found"}), 404
+                    if not (quantity.is_finite() and quantity > 0):
+                        return jsonify({"error": f"Enter the quantity of {ingredient[0]}"}), 400
+                    unit = str(line.get("unit") or ingredient[1]).strip()
+                    if convert_unit(quantity, unit, ingredient[1]) is None:
+                        return jsonify({"error": f"{ingredient[0]} is counted in {ingredient[1]}, which {unit} cannot convert to"}), 400
+                    cur.execute("SELECT 1 FROM inventory_recipes WHERE product_id = %s AND owner_id = %s", (ingredient_id, owner_id))
+                    if cur.fetchone():
+                        return jsonify({"error": f"{ingredient[0]} has its own recipe, so it cannot be an ingredient"}), 400
+                    prepared.append((ingredient_id, quantity, unit))
+
+                cur.execute("DELETE FROM inventory_recipes WHERE product_id = %s AND owner_id = %s", (product_id, owner_id))
+                if prepared:
+                    cur.execute(
+                        "INSERT INTO inventory_recipes (owner_id, product_id, yield_qty) VALUES (%s, %s, %s) RETURNING id",
+                        (owner_id, product_id, yield_qty),
+                    )
+                    recipe_id = cur.fetchone()[0]
+                    for ingredient_id, quantity, unit in prepared:
+                        cur.execute(
+                            "INSERT INTO inventory_recipe_ingredients (recipe_id, ingredient_product_id, quantity, unit) VALUES (%s, %s, %s, %s)",
+                            (recipe_id, ingredient_id, quantity, unit),
+                        )
+                conn.commit()
+        return jsonify({"saved": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @inventory_bp.get("/products")
 def list_products():
     owner_id = get_owner_id()
@@ -208,7 +630,7 @@ def list_products():
                 cur.execute(
                     """
                     SELECT id, name, category, unit, stock_qty, selling_price, cost_price,
-                           low_stock_threshold, status, created_at, updated_at
+                           low_stock_threshold, status, created_at, updated_at, product_type
                     FROM inventory_products
                     WHERE owner_id = %s AND status = 'active'
                     ORDER BY name ASC
@@ -216,6 +638,7 @@ def list_products():
                     (owner_id,),
                 )
                 products = [serialize_product(row) for row in cur.fetchall()]
+                _apply_recipes(cur, owner_id, products)
         return jsonify({"products": products})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -237,6 +660,9 @@ def create_product():
     selling_price = to_decimal(payload.get("sellingPrice"))
     cost_price = to_decimal(payload.get("costPrice"))
     low_stock_threshold = to_decimal(payload.get("lowStockThreshold"))
+    product_type = payload.get("productType") or None
+    if product_type is not None and product_type not in PRODUCT_TYPES:
+        return jsonify({"error": "productType must be SELL or PURCHASE"}), 400
 
     try:
         with get_db_connection() as conn:
@@ -244,12 +670,12 @@ def create_product():
                 cur.execute(
                     """
                     INSERT INTO inventory_products
-                        (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold, product_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id, name, category, unit, stock_qty, selling_price, cost_price,
-                              low_stock_threshold, status, created_at, updated_at
+                              low_stock_threshold, status, created_at, updated_at, product_type
                     """,
-                    (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold),
+                    (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold, product_type),
                 )
                 product = serialize_product(cur.fetchone())
                 conn.commit()
@@ -293,10 +719,12 @@ def create_products_bulk():
         name = " ".join(str(item.get("name", "")).split())
         if not name:
             return jsonify({"error": f"Row {index}: product name is required"}), 400
+        if item.get("productType") not in (None, "", *PRODUCT_TYPES):
+            return jsonify({"error": f"{name}: type must be SELL or PURCHASE"}), 400
         rows.append((name, item))
 
     columns = """id, name, category, unit, stock_qty, selling_price, cost_price,
-                 low_stock_threshold, status, created_at, updated_at"""
+                 low_stock_threshold, status, created_at, updated_at, product_type"""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -314,8 +742,8 @@ def create_products_bulk():
                         cur.execute(
                             f"""
                             INSERT INTO inventory_products
-                                (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                (owner_id, name, category, unit, stock_qty, selling_price, cost_price, low_stock_threshold, product_type)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING {columns}
                             """,
                             (
@@ -327,6 +755,7 @@ def create_products_bulk():
                                 to_decimal(item.get("sellingPrice")),
                                 to_decimal(item.get("costPrice")),
                                 to_decimal(item.get("lowStockThreshold")),
+                                item.get("productType") or None,
                             ),
                         )
                         product = serialize_product(cur.fetchone())
@@ -348,6 +777,15 @@ def create_products_bulk():
                     if _given(item.get("costPrice")):
                         fields.append("cost_price = %s")
                         values.append(to_decimal(item.get("costPrice")))
+                    if item.get("productType"):
+                        if item["productType"] == "PURCHASE":
+                            cur.execute("SELECT 1 FROM inventory_recipes WHERE product_id = %s AND owner_id = %s", (product_id, owner_id))
+                            if cur.fetchone():
+                                # Leaving this block normally would commit the rows before this one.
+                                conn.rollback()
+                                return jsonify({"error": f"{name} has a recipe. Remove the recipe before making it a purchase product."}), 409
+                        fields.append("product_type = %s")
+                        values.append(item["productType"])
                     fields.append("updated_at = NOW()")
                     cur.execute(
                         f"""
@@ -379,7 +817,7 @@ def _load_sheets(owner_id):
             cur.execute(
                 """
                 SELECT id, name, category, unit, stock_qty, selling_price, cost_price,
-                       low_stock_threshold, status, created_at, updated_at
+                       low_stock_threshold, status, created_at, updated_at, product_type
                 FROM inventory_products
                 WHERE owner_id = %s AND status = 'active'
                 ORDER BY name ASC
@@ -387,6 +825,7 @@ def _load_sheets(owner_id):
                 (owner_id,),
             )
             products = [serialize_product(r) for r in cur.fetchall()]
+            _apply_recipes(cur, owner_id, products)
     return build_sheets(row[0] if row else "", products)
 
 
@@ -464,6 +903,11 @@ def update_product(product_id):
     if "lowStockThreshold" in payload:
         fields.append("low_stock_threshold = %s")
         values.append(to_decimal(payload.get("lowStockThreshold")))
+    if "productType" in payload:
+        if payload.get("productType") not in PRODUCT_TYPES:
+            return jsonify({"error": "productType must be SELL or PURCHASE"}), 400
+        fields.append("product_type = %s")
+        values.append(payload.get("productType"))
 
     if not fields:
         return jsonify({"error": "No fields to update"}), 400
@@ -474,12 +918,16 @@ def update_product(product_id):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                if payload.get("productType") == "PURCHASE":
+                    cur.execute("SELECT 1 FROM inventory_recipes WHERE product_id = %s AND owner_id = %s", (product_id, owner_id))
+                    if cur.fetchone():
+                        return jsonify({"error": "This product has a recipe. Remove the recipe first."}), 409
                 cur.execute(
                     f"""
                     UPDATE inventory_products SET {', '.join(fields)}
                     WHERE id = %s AND owner_id = %s
                     RETURNING id, name, category, unit, stock_qty, selling_price, cost_price,
-                              low_stock_threshold, status, created_at, updated_at
+                              low_stock_threshold, status, created_at, updated_at, product_type
                     """,
                     values,
                 )
@@ -503,6 +951,16 @@ def delete_product(product_id):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT p.name FROM inventory_recipe_ingredients i
+                       JOIN inventory_recipes r ON r.id = i.recipe_id
+                       JOIN inventory_products p ON p.id = r.product_id AND p.status = 'active'
+                       WHERE i.ingredient_product_id = %s AND r.owner_id = %s""",
+                    (product_id, owner_id),
+                )
+                used_in = [r[0] for r in cur.fetchall()]
+                if used_in:
+                    return jsonify({"error": f"Used in the recipe of: {', '.join(used_in)}. Remove it from there first."}), 409
                 cur.execute(
                     "UPDATE inventory_products SET status = 'inactive', updated_at = NOW() WHERE id = %s AND owner_id = %s RETURNING id",
                     (product_id, owner_id),
@@ -624,13 +1082,16 @@ def create_transaction():
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, unit, stock_qty, cost_price FROM inventory_products WHERE id = %s AND owner_id = %s",
+                    "SELECT id, name, unit, stock_qty, cost_price, product_type FROM inventory_products WHERE id = %s AND owner_id = %s",
                     (product_id, owner_id),
                 )
                 product_row = cur.fetchone()
                 if not product_row:
                     return jsonify({"error": "Product not found"}), 404
-                _, product_name, product_unit, stock_qty, cost_price = product_row
+                _, product_name, product_unit, stock_qty, cost_price, product_type = product_row
+                if tx_type == "SALE" and product_type == "PURCHASE":
+                    return jsonify({"error": f"{product_name} is a purchase product and cannot be sold. Change its type to sell it."}), 409
+                recipe = _load_recipes(cur, owner_id, [int(product_id)]).get(int(product_id)) if tx_type == "SALE" else None
 
                 if tx_type == "WASTAGE" and amount <= 0:
                     amount = (quantity * cost_price) if cost_price else Decimal("0")
@@ -651,7 +1112,12 @@ def create_transaction():
                 )
                 transaction = serialize_transaction(cur.fetchone())
 
-                if quantity > 0:
+                if recipe and quantity > 0:
+                    # Prepared to order: the ingredients leave stock, and they are the real cost.
+                    usage = [(i["productId"], i["perUnit"] * quantity) for i in recipe["ingredients"]]
+                    total_cost = _take_usage(cur, owner_id, int(transaction["id"]), usage, bool(payload.get("allowShortage")), tx_date)
+                    cur.execute("UPDATE inventory_transactions SET cost_amount = %s WHERE id = %s", (total_cost, transaction["id"]))
+                elif quantity > 0:
                     if tx_type == "PURCHASE":
                         # The latest purchase rate becomes the product's cost price, so
                         # profit on later sales reflects what the stock really cost.
@@ -670,6 +1136,8 @@ def create_transaction():
                         )
                 conn.commit()
         return jsonify({"transaction": transaction}), 201
+    except RecipeShortage as e:
+        return _shortage_response(e)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -748,10 +1216,20 @@ def update_transaction(transaction_id):
                 )
                 transaction = serialize_transaction(cur.fetchone())
 
-                _apply_stock_change(cur, product_id, tx_type, old_qty, undo=True)
-                _apply_stock_change(cur, product_id, tx_type, quantity)
+                old_usage = _give_back_usage(cur, owner_id, transaction_id, old_date)
+                if old_usage:
+                    # A recipe sale keeps the recipe it was sold under, scaled to the new quantity.
+                    scale = quantity / old_qty if old_qty > 0 else Decimal("0")
+                    usage = [(u["productId"], u["required"] * scale, u["unitCost"]) for u in old_usage]
+                    total_cost = _take_usage(cur, owner_id, transaction_id, usage, bool(payload.get("allowShortage")), tx_date)
+                    cur.execute("UPDATE inventory_transactions SET cost_amount = %s WHERE id = %s", (total_cost, transaction_id))
+                else:
+                    _apply_stock_change(cur, product_id, tx_type, old_qty, undo=True)
+                    _apply_stock_change(cur, product_id, tx_type, quantity)
                 conn.commit()
         return jsonify({"transaction": transaction})
+    except RecipeShortage as e:
+        return _shortage_response(e)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -764,6 +1242,10 @@ def delete_transaction(transaction_id):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # Must run before the delete: the usage rows go with the transaction.
+                cur.execute("SELECT transaction_date FROM inventory_transactions WHERE id = %s AND owner_id = %s", (transaction_id, owner_id))
+                found = cur.fetchone()
+                had_usage = bool(_give_back_usage(cur, owner_id, transaction_id, found[0])) if found else False
                 cur.execute(
                     """
                     DELETE FROM inventory_transactions WHERE id = %s AND owner_id = %s
@@ -775,7 +1257,8 @@ def delete_transaction(transaction_id):
                 if not row:
                     return jsonify({"error": "Transaction not found"}), 404
                 # Put the stock back the way it was before this entry existed.
-                _apply_stock_change(cur, row[0], row[1], row[2] or Decimal("0"), undo=True)
+                if not had_usage:
+                    _apply_stock_change(cur, row[0], row[1], row[2] or Decimal("0"), undo=True)
                 conn.commit()
         return jsonify({"message": "Transaction deleted"})
     except Exception as e:
@@ -2013,6 +2496,25 @@ def list_transactions():
                 )
                 cost_of_goods_sold = float(cur.fetchone()[0] or 0)
 
+                # Stock used by hand beyond what the day's recipe sales account for. Those sales
+                # already carry their share in cost of goods, so the overlap is not counted twice.
+                cur.execute(
+                    """
+                    WITH man AS (
+                        SELECT product_id AS p, usage_date AS d, SUM(quantity) AS q, SUM(quantity * unit_cost) AS v
+                        FROM inventory_usage_log
+                        WHERE owner_id = %s AND usage_date BETWEEN %s AND %s GROUP BY 1, 2),
+                    rec AS (
+                        SELECT u.ingredient_product_id AS p, t.transaction_date AS d, SUM(u.required_qty) AS q
+                        FROM inventory_sale_usage u JOIN inventory_transactions t ON t.id = u.transaction_id
+                        WHERE u.owner_id = %s AND t.transaction_date BETWEEN %s AND %s GROUP BY 1, 2)
+                    SELECT COALESCE(SUM(man.v / man.q * GREATEST(man.q - COALESCE(rec.q, 0), 0)), 0)
+                    FROM man LEFT JOIN rec ON rec.p = man.p AND rec.d = man.d
+                    """,
+                    (owner_id, start_date, end_date, owner_id, start_date, end_date),
+                )
+                usage_cost = float(cur.fetchone()[0] or 0)
+
         sale_totals = type_totals.get("SALE", {"amount": 0, "quantity": 0, "count": 0})
         wastage_totals = type_totals.get("WASTAGE", {"amount": 0, "quantity": 0, "count": 0})
         purchase_totals = type_totals.get("PURCHASE", {"amount": 0, "quantity": 0, "count": 0})
@@ -2037,7 +2539,8 @@ def list_transactions():
                 "purchaseCount": purchase_totals["count"],
                 "expenseValue": expense_total,
                 "costOfGoodsSold": cost_of_goods_sold,
-                "netProfit": sale_totals["amount"] - cost_of_goods_sold - wastage_totals["amount"] - expense_total,
+                "usageCost": usage_cost,
+                "netProfit": sale_totals["amount"] - cost_of_goods_sold - usage_cost - wastage_totals["amount"] - expense_total,
                 "paymentMethodSplit": {
                     "cash": payment_totals.get("CASH", 0),
                     "upi": payment_totals.get("UPI", 0),
@@ -2302,6 +2805,7 @@ def list_daily_rates():
                         LIMIT 1
                     ) prev ON TRUE
                     WHERE p.owner_id = %s AND p.status = 'active'
+                      AND COALESCE(p.product_type, 'SELL') <> 'PURCHASE'
                     ORDER BY p.name
                     """,
                     (owner_id,),
@@ -2468,8 +2972,9 @@ def _compute_restock_suggestions(cur, owner_id):
     cur.execute(
         """
         SELECT id, name, unit, stock_qty, low_stock_threshold
-        FROM inventory_products
+        FROM inventory_products p
         WHERE owner_id = %s AND status = 'active'
+          AND NOT EXISTS (SELECT 1 FROM inventory_recipes r WHERE r.product_id = p.id)
         """,
         (owner_id,),
     )
@@ -2488,7 +2993,18 @@ def _compute_restock_suggestions(cur, owner_id):
             (pid, window_start),
         )
         rows = {r[0]: {"qty": float(r[1] or 0), "minDate": r[2]} for r in cur.fetchall()}
-        sale_qty = rows.get("SALE", {}).get("qty", 0)
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(u.required_qty), 0), MIN(t.transaction_date)
+            FROM inventory_sale_usage u JOIN inventory_transactions t ON t.id = u.transaction_id
+            WHERE u.ingredient_product_id = %s AND t.transaction_date >= %s
+            """,
+            (pid, window_start),
+        )
+        used_qty, used_since = cur.fetchone()
+        if used_since:
+            rows["USED"] = {"qty": float(used_qty or 0), "minDate": used_since}
+        sale_qty = rows.get("SALE", {}).get("qty", 0) + rows.get("USED", {}).get("qty", 0)
         wastage_qty = rows.get("WASTAGE", {}).get("qty", 0)
 
         if sale_qty <= 0 and wastage_qty <= 0:

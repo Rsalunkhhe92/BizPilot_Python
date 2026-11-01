@@ -12,6 +12,8 @@ How a payment becomes savings
 - Payments arrive by webhook (instant, needs the backend on a public URL) and by polling
   (sync endpoint, called by the app). shg_gateway_payments.gateway_payment_id is unique, so a
   payment seen by both is posted once.
+- A payment link can instead carry a loan (sent by the Autopilot for an installment due); a
+  payment on it is posted as that loan's repayment (apply_loan_payment) instead of savings.
 - If a payment cannot be posted (member exited, no bank account, group suspended), it is kept
   as Unposted with the reason, and the treasurer can retry after fixing the cause.
 """
@@ -26,6 +28,7 @@ from datetime import date, datetime, timedelta, timezone
 from flask import g, request
 
 from bachatgat_api import record_savings_deposit
+from bachatgat_loans_api import apply_loan_payment
 from bachatgat_common import (
     ApiError,
     bachatgat_bp,
@@ -115,12 +118,18 @@ def _post_gateway_payment(cur, group, gp):
                 txn_date = date.today()  # books for that day are closed: post it today
             bank = load_bank_account(cur, group["id"], None)
             reference = gp["rrn"] or gp["gateway_payment_id"]
-            txn, _alloc, _vol = record_savings_deposit(
-                cur, group, member, money(gp["amount"]), txn_date, "UPI", bank["id"],
-                narration=f"Online savings via Razorpay {'QR' if gp['source'] == 'QR' else 'payment link'}"
-                          + (f" from {gp['payer_vpa']}" if gp["payer_vpa"] else ""),
-                reference_number=reference[:80],
-            )
+            via = f" from {gp['payer_vpa']}" if gp["payer_vpa"] else ""
+            if gp.get("loan_id"):
+                txn = apply_loan_payment(
+                    cur, group, gp["loan_id"], money(gp["amount"]), txn_date, "UPI", bank["id"],
+                    reference[:80], f"Online loan repayment via Razorpay payment link{via}",
+                )
+            else:
+                txn, _alloc, _vol = record_savings_deposit(
+                    cur, group, member, money(gp["amount"]), txn_date, "UPI", bank["id"],
+                    narration=f"Online savings via Razorpay {'QR' if gp['source'] == 'QR' else 'payment link'}{via}",
+                    reference_number=reference[:80],
+                )
             fee_txn_id = None
             if money(gp["fee"]) > 0:
                 fee_txn = post_transaction(
@@ -140,7 +149,7 @@ def _post_gateway_payment(cur, group, gp):
         return False
 
 
-def record_gateway_payment(cur, group, member_id, payment, source):
+def record_gateway_payment(cur, group, member_id, payment, source, loan_id=None):
     """Stores a captured Razorpay payment for a member (once) and posts it.
     Returns True if this call posted it, False if it was already known or could not be posted."""
     payment_id = str(payment.get("id") or "")
@@ -156,16 +165,17 @@ def record_gateway_payment(cur, group, member_id, payment, source):
         return False
     rrn = str((payment.get("acquirer_data") or {}).get("rrn") or "")[:40]
     cur.execute(
-        """INSERT INTO shg_gateway_payments (group_id, member_id, gateway_payment_id, source, amount, fee, payer_vpa, rrn, paid_at, status)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'Unposted')
+        """INSERT INTO shg_gateway_payments (group_id, member_id, gateway_payment_id, source, amount, fee, payer_vpa, rrn,
+               paid_at, status, loan_id)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'Unposted', %s)
            ON CONFLICT (gateway_payment_id) DO NOTHING RETURNING *""",
-        (group["id"], member_id, payment_id, source, amount, fee, str(payment.get("vpa") or "")[:120], rrn, paid_at),
+        (group["id"], member_id, payment_id, source, amount, fee, str(payment.get("vpa") or "")[:120], rrn, paid_at, loan_id),
     )
     gp = cur.fetchone()
     if not gp:
         return False
     record_event(cur, group["id"], "GATEWAY_PAYMENT", gp["id"], "RECEIVED",
-                 details={"paymentId": payment_id, "memberId": member_id, "amount": amount, "source": source})
+                 details={"paymentId": payment_id, "memberId": member_id, "amount": amount, "source": source, "loanId": loan_id})
     return _post_gateway_payment(cur, group, gp)
 
 
@@ -188,7 +198,7 @@ def sync_group(cur, group, force=False):
             continue
         for p in items:
             posted += 1 if record_gateway_payment(cur, group, row["member_id"], p, "QR") else 0
-    cur.execute("SELECT id, member_id, link_id FROM shg_payment_links WHERE group_id = %s AND status = 'Open' AND mode = %s",
+    cur.execute("SELECT id, member_id, link_id, loan_id FROM shg_payment_links WHERE group_id = %s AND status = 'Open' AND mode = %s",
                 (group["id"], creds[2]))
     for link in cur.fetchall():
         try:
@@ -206,7 +216,7 @@ def sync_group(cur, group, force=False):
                 except ApiError as e:
                     errors.append(e.message)
                     continue
-                posted += 1 if record_gateway_payment(cur, group, link["member_id"], payment, "LINK") else 0
+                posted += 1 if record_gateway_payment(cur, group, link["member_id"], payment, "LINK", link["loan_id"]) else 0
             if status == "paid":
                 cur.execute("UPDATE shg_payment_links SET status = 'Paid' WHERE id = %s", (link["id"],))
         elif status in ("cancelled", "expired"):
@@ -394,25 +404,39 @@ def member_payment_link(member_id):
                 amount = money(load_policy(cur, group["id"])["savings_amount"])
         if amount <= 0:
             raise ApiError(422, "Enter the amount for the link")
-        link = _gateway_call("POST", "/payment_links", {
-            "amount": int(amount * 100),
-            "currency": "INR",
-            "accept_partial": False,
-            "description": f"Savings - {group['name_en']}"[:2048],
-            "customer": {"name": member["full_name"][:50], "contact": f"+91{member['mobile']}"},
-            "notify": {"sms": False, "email": False},
-            "reminder_enable": False,
-            "reference_id": f"shg{member_id}-{int(time.time())}",
-            "notes": {"kind": "shg_savings", "shg_group_id": str(group["id"]), "shg_member_id": str(member_id)},
-        }, creds=creds)
-        cur.execute(
-            """INSERT INTO shg_payment_links (group_id, member_id, link_id, short_url, amount, mode)
-               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
-            (group["id"], member_id, link["id"], link.get("short_url") or "", amount, creds[2]),
-        )
-        row = cur.fetchone()
-        record_event(cur, group["id"], "MEMBER", member_id, "PAYMENT_LINK_SENT", details={"amount": amount})
+        row = create_payment_link(cur, group, member, amount, creds)
         return ok({"link": camel(row), "groupName": group["name_en"]}, 201)
+
+
+def create_payment_link(cur, group, member, amount, creds, loan=None, sms=False):
+    """Creates a Razorpay payment link for a member and stores it. With `loan`, the payment
+    is posted as that loan's repayment; otherwise as savings. `sms` lets Razorpay text the
+    link to her (the Autopilot uses it; the treasurer's manual link is shared from the app)."""
+    kind = "shg_loan" if loan else "shg_savings"
+    description = (f"Loan {loan['application_number']} installment" if loan else "Savings") + f" - {group['name_en']}"
+    notes = {"kind": kind, "shg_group_id": str(group["id"]), "shg_member_id": str(member["id"])}
+    if loan:
+        notes["shg_loan_id"] = str(loan["id"])
+    link = _gateway_call("POST", "/payment_links", {
+        "amount": int(money(amount) * 100),
+        "currency": "INR",
+        "accept_partial": False,
+        "description": description[:2048],
+        "customer": {"name": member["full_name"][:50], "contact": f"+91{member['mobile']}"},
+        "notify": {"sms": bool(sms), "email": False},
+        "reminder_enable": bool(sms),
+        "reference_id": f"shg{member['id']}-{int(time.time() * 1000)}",
+        "notes": notes,
+    }, creds=creds)
+    cur.execute(
+        """INSERT INTO shg_payment_links (group_id, member_id, link_id, short_url, amount, mode, loan_id)
+           VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *""",
+        (group["id"], member["id"], link["id"], link.get("short_url") or "", money(amount), creds[2], loan["id"] if loan else None),
+    )
+    row = cur.fetchone()
+    record_event(cur, group["id"], "MEMBER", member["id"], "PAYMENT_LINK_SENT",
+                 details={"amount": money(amount), "loanId": loan["id"] if loan else None, "sms": bool(sms)})
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +477,10 @@ def gateway_webhook(group_id):
                 handled = True
         elif kind == "payment_link.paid":
             link_id = ((entities.get("payment_link") or {}).get("entity") or {}).get("id")
-            cur.execute("SELECT id, member_id FROM shg_payment_links WHERE link_id = %s AND group_id = %s", (link_id, group_id))
+            cur.execute("SELECT id, member_id, loan_id FROM shg_payment_links WHERE link_id = %s AND group_id = %s", (link_id, group_id))
             row = cur.fetchone()
             if row:
-                record_gateway_payment(cur, group, row["member_id"], payment, "LINK")
+                record_gateway_payment(cur, group, row["member_id"], payment, "LINK", row["loan_id"])
                 cur.execute("UPDATE shg_payment_links SET status = 'Paid' WHERE id = %s", (row["id"],))
                 handled = True
     # Always 200 for a correctly signed event, so Razorpay does not retry ones we do not use.

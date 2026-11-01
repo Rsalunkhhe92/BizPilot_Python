@@ -214,6 +214,11 @@ def reverse_transaction(cur, txn_id):
     Posted transactions are never edited or deleted."""
     payload = body()
     reason = text(payload, "reason", 300, required=True, label="Reason")
+    return reverse_txn(cur, txn_id, reason), 201
+
+
+def reverse_txn(cur, txn_id, reason):
+    """Body of reverse_transaction, also used by the Autopilot's Undo."""
     cur.execute("SELECT * FROM shg_transactions WHERE id = %s AND owner_id = %s FOR UPDATE", (txn_id, g.owner_id))
     orig = cur.fetchone()
     if not orig:
@@ -301,7 +306,7 @@ def reverse_transaction(cur, txn_id):
     cur.execute("DELETE FROM shg_scheme_utilizations WHERE txn_id = %s", (txn_id,))
     record_event(cur, group["id"], "TRANSACTION", txn_id, "REVERSED", "Posted", "Reversed",
                  {"reason": reason, "reversalId": reversal["id"]})
-    return {"original": fetch_txn(cur, txn_id), "reversal": fetch_txn(cur, reversal["id"])}, 201
+    return {"original": fetch_txn(cur, txn_id), "reversal": fetch_txn(cur, reversal["id"])}
 
 
 # ---------------------------------------------------------------------------
@@ -513,25 +518,31 @@ def close_period():
         group = load_group(cur, parse_int(payload, "groupId", required=True), lock=True)
         require_active_group(group)
         period_end = parse_date(payload, "periodEnd", required=True, label="Period end")
-        if period_end >= date.today():
-            raise ApiError(422, "Only past periods can be closed")
-        cur.execute("SELECT MAX(period_end) AS last FROM shg_period_closes WHERE group_id = %s", (group["id"],))
-        last = cur.fetchone()["last"]
-        if last and period_end <= last:
-            raise ApiError(409, f"Books are already closed up to {last.isoformat()}")
-        tb = trial_balance(cur, group["id"], period_end)
-        if sum((r["debit"] for r in tb), ZERO) != sum((r["credit"] for r in tb), ZERO):
-            raise ApiError(500, "Trial balance does not agree; contact support before closing")
-        cash = account_balance(cur, group["id"], "CASH", as_of=period_end)
-        bank = account_balance(cur, group["id"], "BANK", as_of=period_end)
-        cur.execute(
-            """INSERT INTO shg_period_closes (group_id, period_end, cash_balance, bank_balance, notes, closed_by)
-               VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
-            (group["id"], period_end, cash, bank, text(payload, "notes", 500), g.owner_id),
-        )
-        row = cur.fetchone()
-        record_event(cur, group["id"], "GROUP", group["id"], "PERIOD_CLOSED", details={"periodEnd": period_end, "cash": cash, "bank": bank})
+        row = close_books(cur, group, period_end, text(payload, "notes", 500))
     return ok({"close": camel(row)}, 201)
+
+
+def close_books(cur, group, period_end, notes=None):
+    """Closes the books up to period_end (no posting on or before it afterwards)."""
+    if period_end >= date.today():
+        raise ApiError(422, "Only past periods can be closed")
+    cur.execute("SELECT MAX(period_end) AS last FROM shg_period_closes WHERE group_id = %s", (group["id"],))
+    last = cur.fetchone()["last"]
+    if last and period_end <= last:
+        raise ApiError(409, f"Books are already closed up to {last.isoformat()}")
+    tb = trial_balance(cur, group["id"], period_end)
+    if sum((r["debit"] for r in tb), ZERO) != sum((r["credit"] for r in tb), ZERO):
+        raise ApiError(500, "Trial balance does not agree; contact support before closing")
+    cash = account_balance(cur, group["id"], "CASH", as_of=period_end)
+    bank = account_balance(cur, group["id"], "BANK", as_of=period_end)
+    cur.execute(
+        """INSERT INTO shg_period_closes (group_id, period_end, cash_balance, bank_balance, notes, closed_by)
+           VALUES (%s, %s, %s, %s, %s, %s) RETURNING *""",
+        (group["id"], period_end, cash, bank, notes, g.owner_id),
+    )
+    row = cur.fetchone()
+    record_event(cur, group["id"], "GROUP", group["id"], "PERIOD_CLOSED", details={"periodEnd": period_end, "cash": cash, "bank": bank})
+    return row
 
 
 # ---------------------------------------------------------------------------

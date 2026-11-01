@@ -68,7 +68,13 @@ BUSINESS_SHEET_HINTS = [
     ("shoe", "Shoes"), ("footwear", "Shoes"), ("mobile", "Mobile"), ("medical", "Medical"), ("pharma", "Medical"),
 ]
 
-SHEET_HEADERS = ["Product", "Unit", "Stock", "Selling Price", "Cost Price"]
+SHEET_HEADERS = ["Product", "Type", "Unit", "Stock", "Selling Price", "Cost Price"]
+TYPE_LABELS = {"SELL": "Sell", "PURCHASE": "Purchase"}
+# What an owner may type in the Type column, in the languages the app supports.
+TYPE_WORDS = {
+    "sell": "SELL", "sale": "SELL", "sales": "SELL", "selling": "SELL", "s": "SELL", "बिक्री": "SELL", "विक्री": "SELL",
+    "purchase": "PURCHASE", "purchased": "PURCHASE", "buy": "PURCHASE", "bought": "PURCHASE", "p": "PURCHASE", "खरीद": "PURCHASE", "खरेदी": "PURCHASE",
+}
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_ROWS = 2000
 
@@ -138,6 +144,7 @@ def build_sheets(business_type, products):
             "stockQty": _number(product.get("stockQty")),
             "sellingPrice": _number(product.get("sellingPrice")),
             "costPrice": _number(product.get("costPrice")),
+            "productType": product.get("productType") or "SELL",
             "existing": True,
         })
         owned.add(name_key(product["name"]))
@@ -149,7 +156,7 @@ def build_sheets(business_type, products):
             if name_key(name) in owned:
                 continue
             rows.append({"name": name, "unit": unit, "stockQty": None, "sellingPrice": None,
-                         "costPrice": None, "existing": False})
+                         "costPrice": None, "productType": None, "existing": False})
 
     bt = (business_type or "").lower()
     business_sheet = next((sheet_name for hint, sheet_name in BUSINESS_SHEET_HINTS if hint in bt), None)
@@ -178,14 +185,18 @@ def build_workbook_base64(sheets):
             cell.font = Font(bold=True)
             cell.fill = header_fill
         for row in sheet["rows"]:
-            ws.append([row["name"], row["unit"], row["stockQty"], row["sellingPrice"], row["costPrice"]])
+            ws.append([row["name"], TYPE_LABELS.get(row.get("productType")), row["unit"], row["stockQty"], row["sellingPrice"], row["costPrice"]])
         ws.column_dimensions["A"].width = 28
-        for column in "BCDE":
+        for column in "BCDEF":
             ws.column_dimensions[column].width = 13
         ws.freeze_panes = "A2"
         positive = DataValidation(type="decimal", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
         ws.add_data_validation(positive)
-        positive.add("C2:E5000")
+        positive.add("D2:F5000")
+        type_list = DataValidation(type="list", formula1='"Sell,Purchase"', allow_blank=True)
+        type_list.error = "Choose Sell or Purchase"
+        ws.add_data_validation(type_list)
+        type_list.add("B2:B5000")
     buffer = io.BytesIO()
     workbook.save(buffer)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -205,9 +216,20 @@ def _cell_number(value):
     return number if number >= 0 else None
 
 
+def _cell_type(value, sheet_name, name):
+    """SELL, PURCHASE, or None when blank, which leaves an existing product as it is."""
+    word = str(value or "").strip().lower()
+    if not word:
+        return None
+    if word not in TYPE_WORDS:
+        raise SheetFileError(f"{sheet_name}, {name}: Type must be Sell or Purchase, not \"{value}\".")
+    return TYPE_WORDS[word]
+
+
 def parse_workbook_base64(file_base64):
     """Reads an uploaded .xlsx back into sheets. Columns are found by header name, so the owner
-    may reorder them; without recognisable headers the template's column order is assumed."""
+    may reorder them, and files saved before the Type column still load; without recognisable
+    headers the older column order (no Type) is assumed."""
     from openpyxl import load_workbook
 
     try:
@@ -234,6 +256,7 @@ def parse_workbook_base64(file_base64):
         "stockQty": ("stock", "qty", "quantity", "stock qty", "opening stock"),
         "sellingPrice": ("selling price", "price", "rate", "mrp", "sale price"),
         "costPrice": ("cost price", "cost", "purchase price", "buying price"),
+        "productType": ("type", "product type", "sell or purchase", "sell/purchase"),
     }
     sheets = []
     total_rows = 0
@@ -264,6 +287,7 @@ def parse_workbook_base64(file_base64):
                 "stockQty": _cell_number(pick("stockQty")),
                 "sellingPrice": _cell_number(pick("sellingPrice")),
                 "costPrice": _cell_number(pick("costPrice")),
+                "productType": _cell_type(pick("productType"), ws.title, name),
             })
             total_rows += 1
             if total_rows > MAX_UPLOAD_ROWS:

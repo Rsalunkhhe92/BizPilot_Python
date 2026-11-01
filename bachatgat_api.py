@@ -1047,49 +1047,56 @@ def due_date_for(frequency, period_start, due_day):
     return period_start + timedelta(days=6 if frequency == "WEEKLY" else 13)
 
 
+def generate_dues_for(cur, group_id, up_to):
+    """Creates the savings dues of every active member for each period up to
+    `up_to`. Safe to run repeatedly: existing dues are kept. Returns the count created.
+    Used by the Generate button and by the Autopilot."""
+    group = load_group(cur, group_id, lock=True)
+    require_active_group(group)
+    policy = load_policy(cur, group_id)
+    if money(policy["savings_amount"]) <= 0:
+        raise ApiError(422, "Set the savings amount in the group policy first")
+    freq, anchor = policy["savings_frequency"], group["formation_date"]
+    cur.execute("SELECT id, joining_date FROM shg_members WHERE group_id = %s AND status = 'Active'", (group_id,))
+    members = cur.fetchall()
+    created = 0
+    last_period = period_bounds(freq, anchor, up_to)
+    for m in members:
+        joined = max(m["joining_date"], anchor)
+        start = period_bounds(freq, anchor, joined)
+        if freq == "MONTHLY" and due_date_for(freq, start, policy["savings_due_day"]) < joined:
+            start = add_period(start, "MONTHLY", 1)
+        k = 0
+        while True:
+            if freq == "MONTHLY":
+                p = add_period(start, "MONTHLY", k)
+            else:
+                p = start + timedelta(days=k * (7 if freq == "WEEKLY" else 14))
+            if p > last_period:
+                break
+            cur.execute(
+                """INSERT INTO shg_savings_dues (group_id, member_id, period_start, due_date, due_amount)
+                   VALUES (%s, %s, %s, %s, %s) ON CONFLICT (member_id, period_start) DO NOTHING RETURNING id""",
+                (group_id, m["id"], p, due_date_for(freq, p, policy["savings_due_day"]), policy["savings_amount"]),
+            )
+            created += 1 if cur.fetchone() else 0
+            k += 1
+            if k > 600:
+                break
+    if created:
+        record_event(cur, group_id, "SAVINGS", group_id, "DUES_GENERATED", details={"upTo": up_to, "created": created})
+    return created
+
+
 @bachatgat_bp.post("/savings/dues/generate")
 def generate_dues():
-    """Creates the savings dues of every active member for each period up to
-    `upTo` (default today). Safe to run repeatedly: existing dues are kept."""
     payload = body()
     group_id = parse_int(payload, "groupId", required=True, label="Group")
     up_to = parse_date(payload, "upTo", default=date.today())
     if up_to > date.today() + timedelta(days=62):
         raise ApiError(422, "Dues can be generated at most two months ahead")
     with tx() as cur:
-        group = load_group(cur, group_id, lock=True)
-        require_active_group(group)
-        policy = load_policy(cur, group_id)
-        if money(policy["savings_amount"]) <= 0:
-            raise ApiError(422, "Set the savings amount in the group policy first")
-        freq, anchor = policy["savings_frequency"], group["formation_date"]
-        cur.execute("SELECT id, joining_date FROM shg_members WHERE group_id = %s AND status = 'Active'", (group_id,))
-        members = cur.fetchall()
-        created = 0
-        last_period = period_bounds(freq, anchor, up_to)
-        for m in members:
-            joined = max(m["joining_date"], anchor)
-            start = period_bounds(freq, anchor, joined)
-            if freq == "MONTHLY" and due_date_for(freq, start, policy["savings_due_day"]) < joined:
-                start = add_period(start, "MONTHLY", 1)
-            k = 0
-            while True:
-                if freq == "MONTHLY":
-                    p = add_period(start, "MONTHLY", k)
-                else:
-                    p = start + timedelta(days=k * (7 if freq == "WEEKLY" else 14))
-                if p > last_period:
-                    break
-                cur.execute(
-                    """INSERT INTO shg_savings_dues (group_id, member_id, period_start, due_date, due_amount)
-                       VALUES (%s, %s, %s, %s, %s) ON CONFLICT (member_id, period_start) DO NOTHING RETURNING id""",
-                    (group_id, m["id"], p, due_date_for(freq, p, policy["savings_due_day"]), policy["savings_amount"]),
-                )
-                created += 1 if cur.fetchone() else 0
-                k += 1
-                if k > 600:
-                    break
-        record_event(cur, group_id, "SAVINGS", group_id, "DUES_GENERATED", details={"upTo": up_to, "created": created})
+        created = generate_dues_for(cur, group_id, up_to)
     return ok({"created": created, "upTo": up_to})
 
 
@@ -1277,3 +1284,4 @@ def savings_ledger():
 import bachatgat_loans_api  # noqa: E402,F401
 import bachatgat_accounts_api  # noqa: E402,F401
 import bachatgat_gateway  # noqa: E402,F401
+import bachatgat_agent  # noqa: E402,F401
