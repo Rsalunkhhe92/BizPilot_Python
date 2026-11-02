@@ -283,6 +283,7 @@ def _apply_recipes(cur, owner_id, products):
             can_make = min(int(i["stockQty"] // i["perUnit"]) for i in ingredients)
             product["stockQty"] = float(max(can_make, 0))
             product["ingredientCount"] = len(ingredients)
+            product["ingredients"] = [{"name": i["name"], "stockQty": float(i["stockQty"]), "unit": i["stockUnit"]} for i in ingredients]
             product["costPrice"] = round(float(sum(i["perUnit"] * i["costPrice"] for i in ingredients)), 2)
     return products
 
@@ -1091,6 +1092,8 @@ def create_transaction():
                 _, product_name, product_unit, stock_qty, cost_price, product_type = product_row
                 if tx_type == "SALE" and product_type == "PURCHASE":
                     return jsonify({"error": f"{product_name} is a purchase product and cannot be sold. Change its type to sell it."}), 409
+                if tx_type == "PURCHASE" and product_type_of(product_type) == "SELL":
+                    return jsonify({"error": f"{product_name} is a selling product and cannot be purchased. Change its type to Purchase to buy it."}), 409
                 recipe = _load_recipes(cur, owner_id, [int(product_id)]).get(int(product_id)) if tx_type == "SALE" else None
 
                 if tx_type == "WASTAGE" and amount <= 0:
@@ -2973,8 +2976,7 @@ def _compute_restock_suggestions(cur, owner_id):
         """
         SELECT id, name, unit, stock_qty, low_stock_threshold
         FROM inventory_products p
-        WHERE owner_id = %s AND status = 'active'
-          AND NOT EXISTS (SELECT 1 FROM inventory_recipes r WHERE r.product_id = p.id)
+        WHERE owner_id = %s AND status = 'active' AND product_type = 'PURCHASE'
         """,
         (owner_id,),
     )

@@ -213,15 +213,34 @@ class RecipeTests(unittest.TestCase):
         self.sell(self.shop["Potato"], 1, 409)
         self.assertEqual(self.qty("Potato"), 30)
 
-    def test_new_product_with_a_cost_stays_a_selling_product(self):
-        mango = self.product("Mango", "kg", 0, 0, 0)["id"]
+    def test_selling_product_cannot_be_purchased(self):
+        for kind in ("SELL", None):  # unclassified reads as selling
+            mango = self.product(f"Mango {kind}", "kg", 5, 100, 60, kind)["id"]
+            data = self.call("post", "/transactions", 409, {"ownerId": self.owner, "productId": mango, "quantity": 10, "amount": 600, "type": "PURCHASE"})
+            self.assertIn("selling product", data["error"])
+            self.assertEqual(self.qty(f"Mango {kind}"), 5)
+        self.call("post", "/transactions", 409, {"ownerId": self.owner, "productId": self.vada, "quantity": 1, "amount": 10, "type": "PURCHASE"})
+        # Changing its type allows it, and wastage is unaffected either way.
+        self.call("post", "/transactions", 201, {"ownerId": self.owner, "productId": mango, "quantity": 1, "type": "WASTAGE"})
+        self.call("put", f"/products/{mango}", 200, {"ownerId": self.owner, "productType": "PURCHASE"})
         self.call("post", "/transactions", 201, {"ownerId": self.owner, "productId": mango, "quantity": 10, "amount": 600, "type": "PURCHASE"})
-        p = self.stock()["Mango"]
-        self.assertEqual(p["productType"], "SELL")
+        self.assertEqual(self.qty("Mango None"), 14)
+
+    def test_new_product_stays_in_the_selling_flow(self):
+        mango = self.product("Mango", "kg", 5, 0, 0)["id"]
+        self.assertEqual(self.stock()["Mango"]["productType"], "SELL")
         rates = self.call("get", f"/daily-rates?owner_id={self.owner}", 200)["rates"]
         self.assertIn("Mango", [r["productName"] for r in rates])
         self.assertNotIn("Potato", [r["productName"] for r in rates])
         self.sell(mango, 1)
+
+    def test_recipe_product_lists_its_ingredients_and_stock(self):
+        self.sell(self.vada, 10)
+        ingredients = {i["name"]: i for i in self.stock()["Vada Pav"]["ingredients"]}
+        self.assertEqual(ingredients["Pav"], {"name": "Pav", "stockQty": 90, "unit": "piece"})
+        self.assertEqual(ingredients["Potato"]["stockQty"], 29)
+        self.assertEqual(len(ingredients), 4)
+        self.assertNotIn("ingredients", self.stock()["Pav"])
 
     def test_existing_products_are_sorted_once(self):
         from inventory_service import ensure_inventory_schema
@@ -449,6 +468,13 @@ class RecipeTests(unittest.TestCase):
         names = [s.get("productName") or s.get("name") for s in data.get("suggestions", data if isinstance(data, list) else [])]
         self.assertNotIn("Vada Pav", names)
         self.assertIn("Pav", names)
+
+    def test_restock_never_suggests_a_selling_product(self):
+        mango = self.product("Mango", "kg", 5, 100, 60, "SELL")["id"]
+        self.sell(mango, 4)
+        data = self.call("get", f"/restock-suggestions?owner_id={self.owner}", 200)
+        names = [s.get("productName") or s.get("name") for s in data.get("suggestions", [])]
+        self.assertNotIn("Mango", names)
 
 
 if __name__ == "__main__":
